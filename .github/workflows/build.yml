@@ -1,0 +1,43 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "${{ matrix.arch }}"
+      - name: Test
+        run: ./scripts/test.sh
+      - name: Build app
+        run: ./scripts/build.sh
+      - name: Package app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/Antigravity ISP.app" \
+            "dist/Antigravity-ISP-${{ matrix.arch }}.zip"
+          shasum -a 256 "dist/Antigravity-ISP-${{ matrix.arch }}.zip" \
+            > "dist/Antigravity-ISP-${{ matrix.arch }}.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Antigravity-ISP-${{ matrix.arch }}
+          path: |
+            dist/Antigravity-ISP-${{ matrix.arch }}.zip
+            dist/Antigravity-ISP-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error

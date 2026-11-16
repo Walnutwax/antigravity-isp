@@ -1,0 +1,21 @@
+.DS_Store
+.build/
+dist/
+*.xcuserstate
+xcuserdata/
+
+# Local state and credentials must never enter the public repository.
+private/
+local/
+.env
+.env.*
+*.log
+config.json
+config.yaml
+config.yml
+settings.json
+profile.json
+runtime.json
+*.key
+*.pem
+*.p12
