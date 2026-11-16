@@ -1,6 +1,6 @@
 # Antigravity ISP
 
-[简体中文](README.md)
+[简体中文](README.md) · [Download v0.1.0 preview](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.1.0)
 
 Give Antigravity its own proxy and launch it in one click while keeping your system proxy settings unchanged. Supports authenticated remote HTTP, HTTPS, and SOCKS5 proxies, without first starting a general-purpose proxy client yourself.
 
@@ -49,7 +49,7 @@ open "dist/Antigravity ISP.app"
 
 The output is `dist/Antigravity ISP.app`; drag it into Applications if desired. Building does not download a proxy core, require Python, or use proxy credentials. The script invokes the system Swift compiler in Swift 5 language mode, linking Cocoa/AppKit and Security.
 
-The default build targets the current Mac's architecture: `arm64` on Apple Silicon or `x86_64` on Intel. It is not a universal binary. CI is configured to test and build on GitHub's `macos-15` and `macos-15-intel` runners, producing a ZIP and SHA-256 file per architecture. CI has not run yet; check the repository's Actions runs for future results.
+The default build targets the current Mac's architecture: `arm64` on Apple Silicon or `x86_64` on Intel. It is not a universal binary. CI tests and builds on GitHub's `macos-15` and `macos-15-intel` runners, producing a ZIP and SHA-256 file per architecture. Both architectures passed the first [build and test run](https://github.com/Walnutwax/antigravity-isp/actions/runs/43839326800).
 
 Builds currently have only a local ad-hoc signature, with no Developer ID signing or Apple notarization. Gatekeeper may block downloaded builds. After verifying that you trust the source and contents, follow macOS's “Open Anyway” flow in System Settings → Privacy & Security, or inspect and build the source yourself.
 
@@ -91,7 +91,7 @@ Public version 0.1.0 has completed the following on macOS 26.7.3 and Apple Silic
 - Downloading Mihomo v1.19.34 from the official source, verifying the pinned SHA-256, and successfully running the core.
 - A connection test using this public version's runtime, the official Mihomo core, and a real remote upstream proxy. The expected exit IP matched, and no temporary credential configurations remained after stopping.
 
-The public version's process-launch flow has been verified using a native test `.app`; end-to-end model requests in the real Antigravity application have not yet been verified for this version. Actual behavior on Intel and macOS 13 has not been tested locally, and GitHub CI has not run yet.
+The public version's process-launch flow has been verified using a native test `.app`; end-to-end model requests in the real Antigravity application have not yet been verified for this version. Apple Silicon and Intel builds and automated tests passed in GitHub Actions. Interactive Intel use, real proxy connections on Intel, and actual macOS 13 runtime behavior remain unverified.
 
 Prototype record: an earlier personal version was exercised with the real Antigravity 2.32.1 application in the same environment. That record is separate from the public-version validation above.
 

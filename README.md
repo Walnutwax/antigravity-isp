@@ -1,6 +1,6 @@
 # Antigravity ISP
 
-[English](README.en.md)
+[English](README.en.md) · [下载 v0.1.0 预览版](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.1.0)
 
 给 Antigravity 单独配置代理，一键启动，保持系统代理不变。支持带认证的远程 HTTP、HTTPS、SOCKS5 代理，无需先手动启动通用代理客户端。
 
@@ -49,7 +49,7 @@ open "dist/Antigravity ISP.app"
 
 输出为 `dist/Antigravity ISP.app`，可将其拖入“应用程序”文件夹。构建脚本不下载代理内核、不需要 Python，也不需要代理凭据。它调用系统 Swift 编译器，使用 Swift 5 语言模式、AppKit/Cocoa 和 Security 框架。
 
-默认按当前 Mac 的架构构建：Apple Silicon 为 `arm64`，Intel 为 `x86_64`；输出不是通用二进制。CI 配置分别使用 GitHub 的 `macos-15` 和 `macos-15-intel` 运行器，测试后生成对应架构的 ZIP 和 SHA-256 文件。CI 尚未运行；后续结果以仓库 Actions 为准。
+默认按当前 Mac 的架构构建：Apple Silicon 为 `arm64`，Intel 为 `x86_64`；输出不是通用二进制。CI 分别使用 GitHub 的 `macos-15` 和 `macos-15-intel` 运行器，测试后生成对应架构的 ZIP 和 SHA-256 文件。首轮两个架构的构建与测试均已通过，见 [Actions 记录](https://github.com/Walnutwax/antigravity-isp/actions/runs/43839326800)。
 
 当前构建仅使用本地临时签名（ad-hoc），没有 Developer ID 签名或 Apple 公证。下载的构建可能被 Gatekeeper 拦截。确认来源和内容可信后，可按 macOS 提示在“系统设置 → 隐私与安全性”中使用“仍要打开”；也可以自行审阅并从源码构建。
 
@@ -91,7 +91,7 @@ Mihomo 按 GPLv3 提供；其源码、许可证和版本对应关系见 [第三�
 - 从官方源下载 Mihomo v1.19.34，按固定 SHA-256 校验并成功运行内核。
 - 使用公开版运行代码、官方 Mihomo 和真实远程上游完成连接测试，预期出口匹配；停止后临时认证配置剩余 0 个。
 
-公开版的新进程启动流程通过原生测试 `.app` 验证，尚未针对真实 Antigravity 的模型请求做端到端验证。Intel、macOS 13 的实际运行尚未本机验证，GitHub CI 尚未运行。
+公开版的新进程启动流程通过原生测试 `.app` 验证，尚未针对真实 Antigravity 的模型请求做端到端验证。Apple Silicon 和 Intel 的云端构建与自动化测试已通过；Intel 真机界面与真实代理、macOS 13 实际运行尚未验证。
 
 原型记录：早期个人版本曾在同一环境中针对 Antigravity 2.32.1 完成真实应用验证；这与上述公开版验证分开记录。
 
