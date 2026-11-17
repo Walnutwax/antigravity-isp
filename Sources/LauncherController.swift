@@ -286,6 +286,9 @@ final class RelaySession: @unchecked Sendable {
 
     static func start(settings: ProxySettings, password: String, cancellation: RuntimeCancellation) throws -> RelaySession {
         try cancellation.check()
+        // Validate here as well as in the UI so every caller fails before spawning a relay.
+        try SettingsValidator.validate(settings)
+        let routing = try RoutingPolicy(settings: settings)
         guard FileManager.default.isExecutableFile(atPath: AppPaths.mihomoExecutable.path) else {
             throw RuntimeFailure("未找到可执行的 Mihomo，请先安装代理内核。")
         }
@@ -313,7 +316,7 @@ final class RelaySession: @unchecked Sendable {
         }
         let session = RelaySession(directory: directory, port: settings.localPort, lockDescriptor: descriptor)
         do {
-            try session.writeConfiguration(settings: settings, password: password)
+            try session.writeConfiguration(settings: settings, password: password, routing: routing)
             try session.requireFreePort()
             try cancellation.check()
             session.process.executableURL = AppPaths.mihomoExecutable
@@ -334,7 +337,7 @@ final class RelaySession: @unchecked Sendable {
         }
     }
 
-    private func writeConfiguration(settings: ProxySettings, password: String) throws {
+    private func writeConfiguration(settings: ProxySettings, password: String, routing: RoutingPolicy) throws {
         var upstream: [String: Any] = [
             "name": "UPSTREAM", "type": settings.proxyType == "socks5" ? "socks5" : "http",
             "server": settings.server, "port": settings.port, "udp": false
@@ -350,7 +353,7 @@ final class RelaySession: @unchecked Sendable {
             "mode": "rule", "log-level": "silent", "external-controller": "",
             "profile": ["store-selected": false, "store-fake-ip": false],
             "tun": ["enable": false], "dns": ["enable": false],
-            "proxies": [upstream], "rules": ["MATCH,UPSTREAM"]
+            "proxies": [upstream], "rules": routing.rules
         ]
         let data = try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
         let path = directory.appendingPathComponent("config.json").path
@@ -410,9 +413,8 @@ final class RelaySession: @unchecked Sendable {
 
     func checkExitIP(expected: String, cancellation: RuntimeCancellation) throws -> String {
         let deadline = Date().addingTimeInterval(20)
-        let endpoints = ["https://api.ipify.org", "https://www.cloudflare.com/cdn-cgi/trace"]
         var detectedIP: String?
-        for endpoint in endpoints {
+        for endpoint in RoutingPolicy.exitIPCheckEndpoints {
             try cancellation.check()
             guard isAlive else { throw RuntimeFailure("本地代理已退出。") }
             let remaining = deadline.timeIntervalSinceNow

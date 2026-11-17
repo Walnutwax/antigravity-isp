@@ -67,13 +67,14 @@ struct RuntimeTests {
         do {
             try prepare()
             try testConfigurationAndOwnership()
+            try testInvalidRoutingDoesNotStart()
             try testOccupiedPort()
             try testCancellationAndFailure()
             try testIPParsing()
             if CommandLine.arguments.count > 2 {
                 try await testApplicationEnvironment(at: URL(fileURLWithPath: CommandLine.arguments[2]))
             }
-            print("Runtime tests passed: private config, authentication escaping, upstream-only routing, owned listener, session lock, occupied port, cancellation, startup failure, cleanup, IP parsing.")
+            print("Runtime tests passed: private config, authentication escaping, allowlist routing, upstream-pinned exit probes, UDP rejection, invalid-routing startup refusal, owned listener, session lock, occupied port, cancellation, startup failure, cleanup, IP parsing.")
         } catch {
             fputs("Runtime tests failed: \(error.localizedDescription)\n", stderr)
             exit(1)
@@ -106,6 +107,8 @@ struct RuntimeTests {
     private static func testConfigurationAndOwnership() throws {
         var settings = try settings()
         settings.proxyType = "https"
+        settings.directDomains = [" Zeta.example.com ", "alpha.example.com", "ALPHA.EXAMPLE.COM", "api.ipify.org", "www.cloudflare.com"]
+        settings.directDomainSuffixes = ["ipify.org", "cloudflare.com", " Assets.Example.org ", "assets.example.org"]
         let password = "test-only:\"quote\\slash\n$literal"
         let session = try RelaySession.start(settings: settings, password: password, cancellation: RuntimeCancellation())
         defer { session.stop() }
@@ -124,7 +127,19 @@ struct RuntimeTests {
         try expect(proxy["password"] as? String == password, "Authentication must survive JSON escaping")
         try expect(proxy["tls"] as? Bool == true, "HTTPS upstream must use TLS")
         try expect(proxy["skip-cert-verify"] == nil, "TLS certificate verification must remain enabled")
-        try expect(config["rules"] as? [String] == ["MATCH,UPSTREAM"], "Every rule must use the upstream with no direct fallback")
+        let rules = config["rules"] as? [String] ?? []
+        try expect(rules == [
+            "NETWORK,udp,REJECT", "DOMAIN,api.ipify.org,UPSTREAM", "DOMAIN,www.cloudflare.com,UPSTREAM",
+            "DOMAIN,alpha.example.com,DIRECT", "DOMAIN,api.ipify.org,DIRECT", "DOMAIN,www.cloudflare.com,DIRECT",
+            "DOMAIN,zeta.example.com,DIRECT", "DOMAIN-SUFFIX,assets.example.org,DIRECT",
+            "DOMAIN-SUFFIX,cloudflare.com,DIRECT", "DOMAIN-SUFFIX,ipify.org,DIRECT", "MATCH,UPSTREAM"
+        ], "Generated config must reject UDP and pin exit probes before normalized explicit DIRECT exceptions")
+        for endpoint in RoutingPolicy.exitIPCheckEndpoints {
+            guard let host = URL(string: endpoint)?.host else { throw TestFailure(message: "Invalid exit probe URL") }
+            let probeRule = "DOMAIN,\(host),UPSTREAM"
+            try expect(rules.firstIndex(of: probeRule).map { $0 < 3 } == true,
+                       "Every actual exit probe endpoint must be pinned before all DIRECT rules")
+        }
         try expect(config["bind-address"] as? String == "127.0.0.1", "Only bind loopback")
         try expect(config["external-controller"] as? String == "", "No external controller")
         try expect((config["dns"] as? [String: Bool])?["enable"] == false, "DNS service disabled")
@@ -137,6 +152,23 @@ struct RuntimeTests {
         session.stop()
         try expect(!session.isAlive, "Owned relay must stop")
         try expect(try sessionDirectories().isEmpty, "Owned config directory must be removed")
+    }
+
+    private static func testInvalidRoutingDoesNotStart() throws {
+        var settings = try settings()
+        // The fake child would exit with code 17 if it were ever launched.
+        settings.server = "exit.invalid"
+        settings.directDomainSuffixes = ["api.openai.com"]
+        try expectFailure("模型服务") {
+            _ = try RelaySession.start(settings: settings, password: "", cancellation: RuntimeCancellation())
+        }
+        try expect(try sessionDirectories().isEmpty, "Invalid routing must not leave a runtime session or config")
+        settings.directDomainSuffixes = []
+        settings.directDomains = ["https://docs.example.com"]
+        try expectFailure("完整域名") {
+            _ = try RelaySession.start(settings: settings, password: "", cancellation: RuntimeCancellation())
+        }
+        try expect(try sessionDirectories().isEmpty, "Malformed routing must not leave a runtime session or config")
     }
 
     private static func testOccupiedPort() throws {

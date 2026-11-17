@@ -31,6 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let passwordField = NSSecureTextField()
     private let expectedExitIPField = NSTextField()
     private let localPortField = NSTextField()
+    private let directDomainsField = NSTextField()
+    private let directDomainSuffixesField = NSTextField()
     private let appPathField = NSTextField()
     private let autoStartButton = NSButton(checkboxWithTitle: "打开本工具时自动启动 Antigravity", target: nil, action: nil)
     private let advancedButton = NSButton()
@@ -326,7 +328,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         advancedButton.setAccessibilityLabel("展开高级设置")
         let advancedHeader = horizontalStack([
             advancedButton,
-            label("出口 IP 与本地端口", size: 11, color: .secondaryLabelColor),
+            label("出口 IP、端口与公司域名", size: 11, color: .secondaryLabelColor),
             NSView()
         ], spacing: 8)
         addFullWidth(advancedHeader, to: fields)
@@ -342,6 +344,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             NSView()
         ], spacing: 10)
         addFullWidth(formRow("本地端口", field: localPortRow), to: advancedFields)
+        configureField(directDomainsField, placeholder: "例如 portal.example.com", accessibility: "精确直连域名")
+        addFullWidth(formRow("精确直连域名", field: directDomainsField), to: advancedFields)
+        configureField(directDomainSuffixesField, placeholder: "例如 corp.example.org（含子域名）", accessibility: "直连域名后缀")
+        addFullWidth(formRow("直连域名后缀", field: directDomainSuffixesField), to: advancedFields)
+        let routingHint = NSTextField(wrappingLabelWithString:
+            "仅填写需要使用本机网络的公司域名，多个用逗号或空格分隔。留空则不配置公司直连；其他代理请求仍走上游。保存后下次启动生效。")
+        routingHint.font = .systemFont(ofSize: 11)
+        routingHint.textColor = .secondaryLabelColor
+        addFullWidth(routingHint, to: advancedFields)
         addFullWidth(advancedFields, to: fields)
         advancedFields.isHidden = true
         editableControls.append(protocolPopup)
@@ -408,9 +419,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         passwordField.stringValue = password
         expectedExitIPField.stringValue = settings.expectedExitIP
         localPortField.stringValue = String(settings.localPort)
+        directDomainsField.stringValue = settings.directDomains.joined(separator: ", ")
+        directDomainSuffixesField.stringValue = settings.directDomainSuffixes.joined(separator: ", ")
         appPathField.stringValue = settings.appPath
         autoStartButton.state = settings.autoStart ? .on : .off
-        if !settings.expectedExitIP.isEmpty || settings.localPort != 17898 {
+        if !settings.expectedExitIP.isEmpty || settings.localPort != 17898
+            || !settings.directDomains.isEmpty || !settings.directDomainSuffixes.isEmpty {
             setAdvancedVisible(true)
         }
     }
@@ -435,6 +449,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         settings.expectedExitIP = expectedExitIPField.stringValue.trimmingCharacters(in: trimming)
         settings.localPort = localPort
         settings.autoStart = autoStartButton.state == .on
+        let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",，"))
+        settings.directDomains = directDomainsField.stringValue.components(separatedBy: separators).filter { !$0.isEmpty }
+        settings.directDomainSuffixes = directDomainSuffixesField.stringValue.components(separatedBy: separators).filter { !$0.isEmpty }
+        let routing: RoutingPolicy
+        do {
+            routing = try RoutingPolicy(settings: settings)
+        } catch {
+            setAdvancedVisible(true)
+            throw error
+        }
+        settings.directDomains = routing.directDomains
+        settings.directDomainSuffixes = routing.directDomainSuffixes
         try SettingsValidator.validate(settings)
         return settings
     }

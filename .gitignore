@@ -16,6 +16,8 @@ config.yml
 settings.json
 profile.json
 runtime.json
+routing.json
+routing.applied.json
 *.key
 *.pem
 *.p12
