@@ -1,6 +1,6 @@
 # Antigravity ISP
 
-[English](README.en.md) · [下载 v0.2.0 预览版](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.2.0)
+[English](README.en.md) · [下载 v0.3.0 预览版](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.3.0)
 
 给 Antigravity 单独配置代理，一键启动，保持系统代理不变。支持带认证的远程 HTTP、HTTPS、SOCKS5 代理，并可指定公司域名走本机网络直连，无需先手动启动通用代理客户端。
 
@@ -68,7 +68,7 @@ open "dist/Antigravity ISP.app"
 
 如果 Antigravity 已在运行，应先正常退出，再通过启动器启动，使新进程获得代理设置。“自动启动”指打开本启动器后自动启动代理和目标应用，不会将应用添加到 macOS 登录项。
 
-运行期间不能修改配置。停止应用和转发后再编辑并保存；新配置在下次通过启动器启动时生效，不支持热更新。
+通过启动器启动 Antigravity 后，可在“高级设置”修改两个直连域名字段并点击“应用分流”。启动器先验证候选配置，再保存列表并请求同一个代理进程重载。新规则用于后续连接。已经建立的连接可能继续沿用原路由，必要时重新打开页面或重连。修改上游代理、预期出口 IP 或监听端口，需要停止后再配置。
 
 不要将含有代理地址、用户名或密码的截图和日志直接提交到公开 Issue。
 

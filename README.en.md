@@ -1,6 +1,6 @@
 # Antigravity ISP
 
-[简体中文](README.md) · [Download v0.2.0 preview](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.2.0)
+[简体中文](README.md) · [Download v0.3.0 preview](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.3.0)
 
 Give Antigravity its own proxy and launch it in one click while keeping your system proxy settings unchanged. Supports authenticated remote HTTP, HTTPS, and SOCKS5 proxies, with optional direct routing for company domains through your Mac's network, without first starting a general-purpose proxy client yourself.
 
@@ -68,7 +68,7 @@ Builds currently have only a local ad-hoc signature, with no Developer ID signin
 
 If Antigravity is already running, quit it normally before launching it here so that the new process receives the proxy settings. Automatic launch means starting the relay and target app when this launcher opens; it does not register a macOS login item.
 
-Settings cannot be edited while running. Stop the application and relay, edit and save, then launch again through this launcher to apply the changes. There is no live reload.
+While Antigravity is running through the launcher, edit the two direct-domain fields in Advanced Settings and click 应用分流 (Apply Routing). The launcher validates the candidate configuration, saves the lists, and requests a reload in the same relay process. New rules apply to subsequent connections. Existing connections may keep their route until they reconnect. Stop the session before changing the upstream proxy, expected exit IP, or listening port.
 
 Remove proxy endpoints, usernames, and passwords before sharing screenshots or logs in public issues.
 

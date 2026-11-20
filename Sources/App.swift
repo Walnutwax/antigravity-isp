@@ -33,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let localPortField = NSTextField()
     private let directDomainsField = NSTextField()
     private let directDomainSuffixesField = NSTextField()
+    private let applyRoutingButton = NSButton()
     private let appPathField = NSTextField()
     private let autoStartButton = NSButton(checkboxWithTitle: "打开本工具时自动启动 Antigravity", target: nil, action: nil)
     private let advancedButton = NSButton()
@@ -349,10 +350,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         configureField(directDomainSuffixesField, placeholder: "例如 corp.example.org（含子域名）", accessibility: "直连域名后缀")
         addFullWidth(formRow("直连域名后缀", field: directDomainSuffixesField), to: advancedFields)
         let routingHint = NSTextField(wrappingLabelWithString:
-            "仅填写需要使用本机网络的公司域名，多个用逗号或空格分隔。留空则不配置公司直连；其他代理请求仍走上游。保存后下次启动生效。")
+            "多个域名可用逗号或空格分隔。留空时，代理请求均走上游。运行期间可应用分流，新规则用于后续连接。")
         routingHint.font = .systemFont(ofSize: 11)
         routingHint.textColor = .secondaryLabelColor
         addFullWidth(routingHint, to: advancedFields)
+        configureButton(applyRoutingButton, title: "应用分流", action: #selector(applyRouting))
+        addFullWidth(formRow("", field: horizontalStack([applyRoutingButton, NSView()], spacing: 0)), to: advancedFields)
         addFullWidth(advancedFields, to: fields)
         advancedFields.isHidden = true
         editableControls.append(protocolPopup)
@@ -449,20 +452,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         settings.expectedExitIP = expectedExitIPField.stringValue.trimmingCharacters(in: trimming)
         settings.localPort = localPort
         settings.autoStart = autoStartButton.state == .on
-        let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",，"))
-        settings.directDomains = directDomainsField.stringValue.components(separatedBy: separators).filter { !$0.isEmpty }
-        settings.directDomainSuffixes = directDomainSuffixesField.stringValue.components(separatedBy: separators).filter { !$0.isEmpty }
-        let routing: RoutingPolicy
-        do {
-            routing = try RoutingPolicy(settings: settings)
-        } catch {
-            setAdvancedVisible(true)
-            throw error
-        }
+        let routing = try readRouting()
         settings.directDomains = routing.directDomains
         settings.directDomainSuffixes = routing.directDomainSuffixes
         try SettingsValidator.validate(settings)
         return settings
+    }
+
+    private func readRouting() throws -> RoutingPolicy {
+        var settings = ProxySettings()
+        let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",，"))
+        settings.directDomains = directDomainsField.stringValue.components(separatedBy: separators).filter { !$0.isEmpty }
+        settings.directDomainSuffixes = directDomainSuffixesField.stringValue.components(separatedBy: separators).filter { !$0.isEmpty }
+        do {
+            return try RoutingPolicy(settings: settings)
+        } catch {
+            setAdvancedVisible(true)
+            throw error
+        }
+    }
+
+    @objc private func applyRouting() {
+        guard controller.canApplyRouting, window.makeFirstResponder(nil) else { return }
+        do {
+            let routing = try readRouting()
+            controller.applyRouting(routing) {
+                try SettingsStore.saveRouting(routing)
+            }
+        } catch {
+            showError(error)
+        }
     }
 
     @objc private func showSettings() {
@@ -587,6 +606,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         for control in editableControls {
             control.isEnabled = !busy
         }
+        let canApplyRouting = controller.canApplyRouting
+        directDomainsField.isEnabled = !busy || canApplyRouting
+        directDomainSuffixesField.isEnabled = !busy || canApplyRouting
+        applyRoutingButton.isHidden = !controller.hasRunningApplication
+        applyRoutingButton.isEnabled = canApplyRouting
         saveButton.isEnabled = !busy
         testButton.isEnabled = !busy && coreIsInstalled
         launchButton.title = controller.hasRunningApplication ? "显示 Antigravity" : "启动 Antigravity"

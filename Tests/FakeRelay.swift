@@ -3,15 +3,45 @@ import Darwin
 import Foundation
 
 guard let option = CommandLine.arguments.firstIndex(of: "-f"),
-      option + 1 < CommandLine.arguments.count,
-      let data = try? Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[option + 1])),
-      let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      option + 1 < CommandLine.arguments.count else { exit(3) }
+
+let configURL = URL(fileURLWithPath: CommandLine.arguments[option + 1])
+func readConfig() -> [String: Any]? {
+    guard let data = try? Data(contentsOf: configURL) else { return nil }
+    return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+}
+
+guard let config = readConfig(),
       let port = config["mixed-port"] as? Int,
       let proxies = config["proxies"] as? [[String: Any]] else { exit(3) }
+
+if CommandLine.arguments.contains("-t") {
+    let attributes = try? FileManager.default.attributesOfItem(atPath: configURL.path)
+    guard (attributes?[.posixPermissions] as? NSNumber)?.intValue == 0o600,
+          let rules = config["rules"] as? [String] else { exit(19) }
+    if rules.contains("DOMAIN,fail-preflight.example.invalid,DIRECT") {
+        print("synthetic diagnostic payload")
+        exit(21)
+    }
+    if rules.contains("DOMAIN,slow-preflight.example.invalid,DIRECT") {
+        Thread.sleep(forTimeInterval: 5)
+    }
+    exit(0)
+}
 
 let server = proxies.first?["server"] as? String
 if server == "exit.invalid" { exit(17) }
 if server == "slow.invalid" { Thread.sleep(forTimeInterval: 5) }
+
+signal(SIGHUP, SIG_IGN)
+let reloads = DispatchSource.makeSignalSource(signal: SIGHUP, queue: DispatchQueue.global())
+reloads.setEventHandler {
+    guard let rules = readConfig()?["rules"] as? [String],
+          let data = try? JSONEncoder().encode(rules) else { return }
+    let observed = configURL.deletingLastPathComponent().appendingPathComponent("observed-rules.json")
+    try? data.write(to: observed, options: [.atomic])
+}
+reloads.activate()
 
 let descriptor = socket(AF_INET, SOCK_STREAM, 0)
 guard descriptor >= 0 else { exit(4) }

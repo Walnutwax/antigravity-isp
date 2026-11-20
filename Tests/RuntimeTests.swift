@@ -70,11 +70,12 @@ struct RuntimeTests {
             try testInvalidRoutingDoesNotStart()
             try testOccupiedPort()
             try testCancellationAndFailure()
+            try testRoutingReload()
             try testIPParsing()
             if CommandLine.arguments.count > 2 {
                 try await testApplicationEnvironment(at: URL(fileURLWithPath: CommandLine.arguments[2]))
             }
-            print("Runtime tests passed: private config, authentication escaping, allowlist routing, upstream-pinned exit probes, UDP rejection, invalid-routing startup refusal, owned listener, session lock, occupied port, cancellation, startup failure, cleanup, IP parsing.")
+            print("Runtime tests passed: private config, authentication escaping, allowlist routing, upstream-pinned exit probes, UDP rejection, invalid-routing startup refusal, owned listener, session lock, occupied port, cancellation, startup failure, routing reload and rollback, cleanup, IP parsing.")
         } catch {
             fputs("Runtime tests failed: \(error.localizedDescription)\n", stderr)
             exit(1)
@@ -200,6 +201,85 @@ struct RuntimeTests {
         }
         try expect(Date().timeIntervalSince(started) < 3, "Cancellation should promptly stop an owned slow child")
         try expect(try sessionDirectories().isEmpty, "Cancellation must clean its session")
+    }
+
+    private static func testRoutingReload() throws {
+        let original = try settings()
+        let session = try RelaySession.start(settings: original, password: "ReloadTestPassword", cancellation: RuntimeCancellation())
+        defer { session.stop() }
+        let directory = try sessionDirectories()[0]
+        let configURL = directory.appendingPathComponent("config.json")
+        let observedURL = directory.appendingPathComponent("observed-rules.json")
+        let originalData = try Data(contentsOf: configURL)
+        var persistedRules = try RoutingPolicy(settings: original).rules
+
+        var edited = original
+        edited.directDomains = ["fail-preflight.example.invalid"]
+        let rejected = try RoutingPolicy(settings: edited)
+        try expectFailure("退出码 21") {
+            _ = try session.prepareRouting(rejected, cancellation: RuntimeCancellation())
+        }
+
+        edited.directDomains = ["slow-preflight.example.invalid"]
+        let slow = try RoutingPolicy(settings: edited)
+        let token = RuntimeCancellation()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { token.cancel() }
+        try expectFailure("取消") {
+            _ = try session.prepareRouting(slow, cancellation: token)
+        }
+        try expect(try Data(contentsOf: configURL) == originalData, "Failed or cancelled preflight must preserve the original config")
+        try expect(!FileManager.default.fileExists(atPath: observedURL.path), "Failed or cancelled preflight must not signal the relay")
+
+        edited.directDomains = ["reload.example.invalid"]
+        let updated = try RoutingPolicy(settings: edited)
+        let update = try session.prepareRouting(updated, cancellation: RuntimeCancellation())
+        defer { update.discard() }
+        try session.applyRouting(update) {
+            try waitForObservedRules(updated.rules, at: observedURL)
+            persistedRules = updated.rules
+        }
+        let updatedData = try Data(contentsOf: configURL)
+        var actual = try JSONSerialization.jsonObject(with: updatedData) as! [String: Any]
+        let originalConfig = try JSONSerialization.jsonObject(with: originalData) as! [String: Any]
+        try expect(actual["rules"] as? [String] == updated.rules, "The owned config should include the new rules")
+        actual["rules"] = originalConfig["rules"]
+        try expect((actual as NSDictionary).isEqual(to: originalConfig), "All non-routing config fields must be preserved")
+        try expect(persistedRules == updated.rules, "Successful reload must invoke persistence")
+        try expect(session.isAlive, "The same relay session must stay alive after reload")
+        let permissions = try FileManager.default.attributesOfItem(atPath: configURL.path)[.posixPermissions] as? NSNumber
+        try expect(permissions?.intValue == 0o600, "Atomic replacement must keep mode 0600")
+        update.discard()
+
+        edited.directDomains = ["rollback.example.invalid"]
+        let rollback = try RoutingPolicy(settings: edited)
+        let rollbackUpdate = try session.prepareRouting(rollback, cancellation: RuntimeCancellation())
+        defer { rollbackUpdate.discard() }
+        var sawBeforeRollback = false
+        try expectFailure("无法保存分流规则") {
+            try session.applyRouting(rollbackUpdate) {
+                try waitForObservedRules(rollback.rules, at: observedURL)
+                sawBeforeRollback = true
+                throw TestFailure(message: "Simulated persistence failure")
+            }
+        }
+        try expect(sawBeforeRollback, "The fixture must see the candidate loaded before simulating a failed save")
+        try waitForObservedRules(updated.rules, at: observedURL)
+        try expect(try Data(contentsOf: configURL) == updatedData, "Failed persistence must atomically restore the previous bytes")
+        try expect(persistedRules == updated.rules, "Failed persistence must keep the previous saved rules")
+        try expect(session.canApplyRouting, "Successful rollback must leave routing updates available")
+        rollbackUpdate.discard()
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        try expect(Set(files) == ["config.json", "observed-rules.json"], "No staging config should remain")
+    }
+
+    private static func waitForObservedRules(_ rules: [String], at url: URL) throws {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let data = try? Data(contentsOf: url),
+               (try? JSONDecoder().decode([String].self, from: data)) == rules { return }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        throw TestFailure(message: "The owned fixture did not load the expected rules")
     }
 
     private static func testIPParsing() throws {

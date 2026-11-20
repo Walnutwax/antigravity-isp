@@ -1,5 +1,10 @@
 # Changelog / 更新记录
 
+## v0.3.0 — Preview / 预览版
+
+- Validate and reload direct-domain rules while Antigravity runs through the launcher. Save the updated lists for subsequent launches and apply the new rules to subsequent connections.
+- Antigravity 运行期间可验证并重载直连域名规则。更新后的名单会保存，新规则用于后续连接。
+
 ## v0.2.0 — Preview / 预览版
 
 - Add advanced settings for exact direct domains (`directDomains`) and direct domain suffixes (`directDomainSuffixes`), both empty by default. Accept comma or whitespace separated entries; reject direct entries for known model service domains.

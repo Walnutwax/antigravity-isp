@@ -9,6 +9,9 @@ final class LauncherController {
     var onStopCompletion: ((Bool) -> Void)?
     private(set) var isRunning = false
     var hasRunningApplication: Bool { application?.isTerminated == false }
+    var canApplyRouting: Bool {
+        !stopping && operationTask == nil && hasRunningApplication && relay?.canApplyRouting == true
+    }
 
     private var operationTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
@@ -24,6 +27,34 @@ final class LauncherController {
 
     func test(settings: ProxySettings, password: String) {
         begin(settings: settings, password: password, launchApplication: false)
+    }
+
+    func applyRouting(_ routing: RoutingPolicy, persist: @escaping () throws -> Void) {
+        guard canApplyRouting, let session = relay else { return }
+        let token = RuntimeCancellation()
+        cancellation = token
+        operationTask = Task { [weak self] in
+            guard let self else { return }
+            let message: String
+            do {
+                let update = try await Task.detached(priority: .userInitiated) {
+                    try session.prepareRouting(routing, cancellation: token)
+                }.value
+                defer { update.discard() }
+                try token.check()
+                guard self.hasRunningApplication else {
+                    throw RuntimeFailure("Antigravity 已退出，分流规则未更新。")
+                }
+                try session.applyRouting(update, persist: persist)
+                message = "分流规则已保存，已请求本地代理重新加载。已有连接可能需要重新连接。"
+            } catch {
+                message = error.localizedDescription
+            }
+            self.operationTask = nil
+            self.cancellation = nil
+            if !self.stopping { self.report(message, busy: true) }
+        }
+        report("正在检查新的分流规则…", busy: true)
     }
 
     func showApplication() {
@@ -95,7 +126,9 @@ final class LauncherController {
         report(launchApplication ? "正在启动本地代理并检查出口…" : "正在测试代理连接…", busy: true)
         operationTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.operationTask = nil }
+            defer {
+                if self.stopping { self.operationTask = nil }
+            }
             do {
                 let session = try await Task.detached(priority: .userInitiated) {
                     try RelaySession.start(settings: settings, password: password, cancellation: token)
@@ -126,11 +159,14 @@ final class LauncherController {
                             throw RuntimeFailure("本地代理意外退出；Antigravity 仍在运行，请正常退出应用后重试。")
                         }
                     }
+                    self.operationTask = nil
+                    self.cancellation = nil
                     self.report("Antigravity 已启动 · 出口 IP：\(exitIP)", busy: true)
                     self.startMonitoring()
                 } else {
                     await self.cleanRelay()
                     try token.check()
+                    self.operationTask = nil
                     self.cancellation = nil
                     self.report("测试成功 · 出口 IP：\(exitIP)", busy: false)
                 }
@@ -139,11 +175,15 @@ final class LauncherController {
                 // concurrently by Launch Services before removing its proxy.
                 if self.stopping { return }
                 if let app = self.application, !app.isTerminated {
+                    self.operationTask = nil
+                    self.cancellation = nil
                     self.report(error.localizedDescription, busy: true)
                     self.startMonitoring()
                 } else {
                     self.application = nil
                     await self.cleanRelay()
+                    if self.stopping { return }
+                    self.operationTask = nil
                     self.cancellation = nil
                     self.report(error.localizedDescription, busy: false)
                 }
@@ -165,6 +205,7 @@ final class LauncherController {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard !Task.isCancelled, let self, !self.stopping else { return }
+                guard self.operationTask == nil else { continue }
                 if self.application?.isTerminated != false {
                     self.application = nil
                     await self.cleanRelay()
@@ -275,8 +316,11 @@ final class RelaySession: @unchecked Sendable {
     private let port: Int
     private var lockDescriptor: Int32
     private var stopped = false
+    private var routingRollbackFailed = false
 
     var isAlive: Bool { process.isRunning }
+    var canApplyRouting: Bool { !routingRollbackFailed && isAlive }
+    private var configURL: URL { directory.appendingPathComponent("config.json") }
 
     private init(directory: URL, port: Int, lockDescriptor: Int32) {
         self.directory = directory
@@ -320,7 +364,7 @@ final class RelaySession: @unchecked Sendable {
             try session.requireFreePort()
             try cancellation.check()
             session.process.executableURL = AppPaths.mihomoExecutable
-            session.process.arguments = ["-d", directory.path, "-f", directory.appendingPathComponent("config.json").path]
+            session.process.arguments = ["-d", directory.path, "-f", session.configURL.path]
             session.process.currentDirectoryURL = directory
             session.process.standardInput = FileHandle.nullDevice
             session.process.standardOutput = FileHandle.nullDevice
@@ -356,8 +400,85 @@ final class RelaySession: @unchecked Sendable {
             "proxies": [upstream], "rules": routing.rules
         ]
         let data = try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
-        let path = directory.appendingPathComponent("config.json").path
-        let descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        try writeConfigurationData(data, to: configURL)
+    }
+
+    func prepareRouting(_ routing: RoutingPolicy, cancellation: RuntimeCancellation) throws -> RelayRoutingUpdate {
+        try cancellation.check()
+        guard isAlive else { throw RuntimeFailure("本地代理已退出，分流规则未更新。") }
+        let currentData = try Data(contentsOf: configURL)
+        guard var candidate = try JSONSerialization.jsonObject(with: currentData) as? [String: Any] else {
+            throw RuntimeFailure("无法读取当前会话的配置，分流规则未更新。")
+        }
+        candidate["rules"] = routing.rules
+        let data = try JSONSerialization.data(withJSONObject: candidate, options: [.sortedKeys])
+        let identifier = UUID().uuidString
+        let update = RelayRoutingUpdate(
+            candidate: directory.appendingPathComponent("routing-\(identifier).json"),
+            previous: directory.appendingPathComponent("previous-\(identifier).json")
+        )
+        do {
+            try writeConfigurationData(data, to: update.candidate)
+            let checked = try RuntimeCommand.run(
+                executable: AppPaths.mihomoExecutable.path,
+                arguments: ["-t", "-d", directory.path, "-f", update.candidate.path],
+                timeout: 10, cancellation: cancellation, captureOutput: false
+            )
+            try cancellation.check()
+            guard checked.status == 0 else {
+                throw RuntimeFailure(checked.status == -1
+                    ? "Mihomo 检查分流规则超时，原配置继续使用。"
+                    : "Mihomo 检查分流规则失败（退出码 \(checked.status)），原配置继续使用。")
+            }
+            // Keep an atomic rollback path without writing a second copy of the credentials.
+            guard link(configURL.path, update.previous.path) == 0 else {
+                throw RuntimeFailure("无法保留当前会话的配置，分流规则未更新。")
+            }
+            return update
+        } catch {
+            update.discard()
+            throw error
+        }
+    }
+
+    /// The controller serializes this short commit and persistence step with stop and monitoring.
+    func applyRouting(_ update: RelayRoutingUpdate, persist: () throws -> Void) throws {
+        guard canApplyRouting else { throw RuntimeFailure("当前会话无法更新分流规则。") }
+        guard rename(update.candidate.path, configURL.path) == 0 else {
+            throw RuntimeFailure("无法替换当前会话的配置，分流规则未更新。")
+        }
+        var reloadRequested = false
+        do {
+            try requestRoutingReload()
+            reloadRequested = true
+            do { try persist() }
+            catch { throw RuntimeFailure("无法保存分流规则，已恢复上一次配置并请求重新加载。") }
+        } catch {
+            // Mihomo reads the same path on SIGHUP. If persistence failed, make
+            // that path point at the old config before requesting another reload.
+            guard rename(update.previous.path, configURL.path) == 0 else {
+                routingRollbackFailed = true
+                throw RuntimeFailure("分流规则未保存，无法恢复会话配置。请退出 Antigravity 后重新启动。")
+            }
+            if reloadRequested {
+                do { try requestRoutingReload() }
+                catch {
+                    routingRollbackFailed = true
+                    throw RuntimeFailure("分流规则未保存，无法请求代理重新加载原配置。请退出 Antigravity 后重新启动。")
+                }
+            }
+            throw error
+        }
+    }
+
+    private func requestRoutingReload() throws {
+        guard process.isRunning, kill(process.processIdentifier, SIGHUP) == 0 else {
+            throw RuntimeFailure("无法请求本地代理重新加载，分流规则未保存。")
+        }
+    }
+
+    private func writeConfigurationData(_ data: Data, to url: URL) throws {
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else { throw RuntimeFailure("无法创建私有代理配置。") }
         defer { close(descriptor) }
         try data.withUnsafeBytes { buffer in
@@ -480,16 +601,26 @@ final class RelaySession: @unchecked Sendable {
     deinit { stop() }
 }
 
+struct RelayRoutingUpdate: Sendable {
+    fileprivate let candidate: URL
+    fileprivate let previous: URL
+
+    func discard() {
+        try? FileManager.default.removeItem(at: candidate)
+        try? FileManager.default.removeItem(at: previous)
+    }
+}
+
 private enum RuntimeCommand {
     static func run(executable: String, arguments: [String], timeout: TimeInterval,
-                    cancellation: RuntimeCancellation) throws -> (status: Int32, output: String) {
+                    cancellation: RuntimeCancellation, captureOutput: Bool = true) throws -> (status: Int32, output: String) {
         let process = Process()
-        let output = Pipe()
+        let output = captureOutput ? Pipe() : nil
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"]
         process.standardInput = FileHandle.nullDevice
-        process.standardOutput = output
+        process.standardOutput = output as Any? ?? FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try cancellation.check()
         try process.run()
@@ -507,6 +638,7 @@ private enum RuntimeCommand {
             stopOwnedCommand(process)
             throw error
         }
+        guard let output else { return (process.terminationStatus, "") }
         let data = output.fileHandleForReading.readDataToEndOfFile()
         guard data.count <= 65_536 else { return (-1, "") }
         return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")

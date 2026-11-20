@@ -13,12 +13,23 @@ enum SettingsStore {
 
     static func save(_ settings: ProxySettings, password: String) throws {
         try SettingsValidator.validate(settings)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(settings)
+        let data = try encode(settings)
         try AppPaths.createPrivateDirectory(AppPaths.supportDirectory)
         try savePassword(password)
         try AppPaths.writePrivate(data, to: AppPaths.settingsFile)
+    }
+
+    static func saveRouting(_ routing: RoutingPolicy) throws {
+        var settings = try load()
+        settings.directDomains = routing.directDomains
+        settings.directDomainSuffixes = routing.directDomainSuffixes
+        try AppPaths.writePrivate(try encode(settings), to: AppPaths.settingsFile)
+    }
+
+    private static func encode(_ settings: ProxySettings) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(settings)
     }
 
     static func loadPassword() throws -> String {
