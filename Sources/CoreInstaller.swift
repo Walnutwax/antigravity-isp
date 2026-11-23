@@ -12,10 +12,11 @@ enum CoreInstaller {
     static let archiveSHA256 = "703bceaa494732fa456f47e6ac2f06bf0bc5593d4c927d5f61e10f1a31039c37"
     #endif
     static let sourceURL = "https://github.com/MetaCubeX/mihomo/releases/tag/" + version
+    static let downloadURL = "https://github.com/MetaCubeX/mihomo/releases/download/" + version + "/" + asset
 
-    static func ensureInstalled(progress: @escaping (String) -> Void) async throws {
+    static func ensureInstalled(archive sourceArchive: URL? = nil, progress: @escaping (String) -> Void) async throws {
         try await Task.detached(priority: .userInitiated) {
-            if FileManager.default.isExecutableFile(atPath: AppPaths.mihomoExecutable.path) {
+            if sourceArchive == nil, FileManager.default.isExecutableFile(atPath: AppPaths.mihomoExecutable.path) {
                 progress("代理内核已安装。")
                 return
             }
@@ -25,25 +26,29 @@ enum CoreInstaller {
             defer { try? FileManager.default.removeItem(at: directory) }
             let archive = directory.appendingPathComponent("mihomo.gz")
             let binary = directory.appendingPathComponent("mihomo")
-            let url = "https://github.com/MetaCubeX/mihomo/releases/download/" + version + "/" + asset
-            progress("正在从 Mihomo 官方仓库下载代理内核…")
-            let download = Process()
-            download.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            download.arguments = ["-q", "--fail", "--silent", "--show-error", "--location",
-                                  "--proto", "=https", "--proto-redir", "=https",
-                                  "--connect-timeout", "15", "--max-time", "90",
-                                  "--retry", "1", "--output", archive.path, url]
-            download.standardOutput = FileHandle.nullDevice
-            download.standardError = FileHandle.nullDevice
-            try download.run()
-            download.waitUntilExit()
-            guard download.terminationStatus == 0 else {
-                throw UserFacingError("下载未完成，请确认本机能够访问 GitHub 后重试。官方内核下载地址见项目 README。")
+            if let sourceArchive {
+                progress("正在读取本地内核安装包…")
+                try FileManager.default.copyItem(at: sourceArchive, to: archive)
+            } else {
+                progress("正在从 Mihomo 官方仓库下载代理内核…")
+                let download = Process()
+                download.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                download.arguments = ["-q", "--fail", "--silent", "--show-error", "--location",
+                                      "--proto", "=https", "--proto-redir", "=https",
+                                      "--connect-timeout", "15", "--max-time", "90",
+                                      "--retry", "1", "--output", archive.path, downloadURL]
+                download.standardOutput = FileHandle.nullDevice
+                download.standardError = FileHandle.nullDevice
+                try download.run()
+                download.waitUntilExit()
+                guard download.terminationStatus == 0 else {
+                    throw UserFacingError("下载未完成。请确认本机能够访问 GitHub，或从官方发布页下载 \(asset) 后点击“从文件安装…”。")
+                }
             }
             progress("正在校验下载文件…")
             let bytes = try Data(contentsOf: archive, options: .mappedIfSafe)
             guard verifiedArchive(bytes) else {
-                throw UserFacingError("下载文件校验失败，未安装或执行该文件。请稍后重试。")
+                throw UserFacingError("内核文件校验失败，未安装或执行。请选择官方 \(asset)；其他版本或架构的文件不能安装。")
             }
             guard FileManager.default.createFile(atPath: binary.path, contents: nil,
                                                   attributes: [.posixPermissions: 0o600]) else {

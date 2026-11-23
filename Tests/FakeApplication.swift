@@ -22,7 +22,7 @@ struct FixtureMain {
         let app = NSApplication.shared
         let delegate = FixtureDelegate()
         app.delegate = delegate
-        app.setActivationPolicy(.prohibited)
+        app.setActivationPolicy(.accessory)
         withExtendedLifetime(delegate) { app.run() }
     }
 }

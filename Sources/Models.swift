@@ -10,6 +10,9 @@ struct ProxySettings: Codable, Equatable {
     var localPort = 17898
     var expectedExitIP = ""
     var autoStart = false
+    var useSubscription = false
+    var subscriptionNode = ""
+    var subscriptionUseManualProxy = false
     var directDomains: [String] = []
     var directDomainSuffixes: [String] = []
 
@@ -17,6 +20,7 @@ struct ProxySettings: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case appPath, server, port, proxyType, username, localPort, expectedExitIP, autoStart
+        case useSubscription, subscriptionNode, subscriptionUseManualProxy
         case directDomains, directDomainSuffixes
     }
 
@@ -30,6 +34,9 @@ struct ProxySettings: Codable, Equatable {
         localPort = try values.decode(Int.self, forKey: .localPort)
         expectedExitIP = try values.decode(String.self, forKey: .expectedExitIP)
         autoStart = try values.decode(Bool.self, forKey: .autoStart)
+        useSubscription = try values.decodeIfPresent(Bool.self, forKey: .useSubscription) ?? false
+        subscriptionNode = try values.decodeIfPresent(String.self, forKey: .subscriptionNode) ?? ""
+        subscriptionUseManualProxy = try values.decodeIfPresent(Bool.self, forKey: .subscriptionUseManualProxy) ?? false
         // Version 0.1.0 did not persist routing exceptions.
         directDomains = try values.decodeIfPresent([String].self, forKey: .directDomains) ?? []
         directDomainSuffixes = try values.decodeIfPresent([String].self, forKey: .directDomainSuffixes) ?? []
@@ -45,10 +52,12 @@ struct UserFacingError: LocalizedError {
 /// An explicit allowlist only. This guardrail is not a complete inventory of model-service domains.
 struct RoutingPolicy {
     static let maximumEntriesPerGroup = 128
-    private static let ipifyHost = "api.ipify.org"
-    private static let cloudflareHost = "www.cloudflare.com"
+    // Several independent echo services keep the exit check usable when a node
+    // blocks or breaks one of them. Every host is pinned to UPSTREAM below.
+    private static let exitIPProbeHosts = ["api.ipify.org", "www.cloudflare.com", "api.myip.com", "ifconfig.me"]
     static let exitIPCheckEndpoints = [
-        "https://\(ipifyHost)", "https://\(cloudflareHost)/cdn-cgi/trace"
+        "https://api.ipify.org", "https://www.cloudflare.com/cdn-cgi/trace",
+        "https://api.myip.com", "https://ifconfig.me/ip"
     ]
 
     let directDomains: [String]
@@ -62,7 +71,8 @@ struct RoutingPolicy {
     var rules: [String] {
         // UDP must not fall through an unsupported upstream into a DIRECT rule.
         // Pin the probes before user exceptions so the reported exit always tests UPSTREAM.
-        ["NETWORK,udp,REJECT", "DOMAIN,\(Self.ipifyHost),UPSTREAM", "DOMAIN,\(Self.cloudflareHost),UPSTREAM"]
+        ["NETWORK,udp,REJECT"]
+            + Self.exitIPProbeHosts.map { "DOMAIN,\($0),UPSTREAM" }
             + directDomains.map { "DOMAIN,\($0),DIRECT" }
             + directDomainSuffixes.map { "DOMAIN-SUFFIX,\($0),DIRECT" }
             + ["MATCH,UPSTREAM"]
@@ -168,6 +178,22 @@ enum AppPaths {
     static var runtimeDirectory: URL { supportDirectory.appendingPathComponent("runtime", isDirectory: true) }
     static var mihomoExecutable: URL { supportDirectory.appendingPathComponent("bin/mihomo") }
     static var settingsFile: URL { supportDirectory.appendingPathComponent("settings.json") }
+    static var subscriptionCatalogFile: URL { supportDirectory.appendingPathComponent("subscription-nodes.json") }
+    static var subscriptionCacheFile: URL { supportDirectory.appendingPathComponent("subscription-cache.yaml") }
+    static var subscriptionCacheMetadataFile: URL { supportDirectory.appendingPathComponent("subscription-cache.json") }
+
+    /// Removes partial subscription downloads left by a node refresh that was
+    /// interrupted by quitting or crashing the launcher.
+    static func cleanupAbandonedRefreshDirectories() {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: runtimeDirectory, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard name.hasPrefix("node-refresh-") || name.hasPrefix("prefetch-") else { continue }
+            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            try? FileManager.default.removeItem(at: entry)
+        }
+    }
 
     static func createPrivateDirectory(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
@@ -207,6 +233,27 @@ enum SettingsValidator {
     }
 
     static func validate(_ settings: ProxySettings) throws {
+        if !settings.useSubscription || settings.subscriptionUseManualProxy {
+            try validateManualProxy(settings)
+        }
+        guard !["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "UPSTREAM", "DOWNLOAD"].contains(settings.subscriptionNode),
+              !settings.subscriptionNode.contains(where: { $0.isNewline }) else {
+            throw UserFacingError("请填写订阅中实际的节点名称，不能使用保留名称或换行。")
+        }
+        guard (1024...65535).contains(settings.localPort) else {
+            throw UserFacingError("本机端口须为 1024–65535。")
+        }
+        guard settings.expectedExitIP.isEmpty || isIPAddress(settings.expectedExitIP) else {
+            throw UserFacingError("预期出口请填写有效的 IP 地址；不需要固定出口时留空。")
+        }
+        guard settings.appPath.hasPrefix("/"), settings.appPath.hasSuffix(".app"),
+              !settings.appPath.contains("\n") else {
+            throw UserFacingError("请选择 Antigravity.app 的完整路径。")
+        }
+        _ = try RoutingPolicy(settings: settings)
+    }
+
+    private static func validateManualProxy(_ settings: ProxySettings) throws {
         guard ["http", "https", "socks5"].contains(settings.proxyType) else {
             throw UserFacingError("请选择 HTTP、HTTPS 或 SOCKS5 代理。")
         }
@@ -223,16 +270,19 @@ enum SettingsValidator {
         guard !(["localhost", "127.0.0.1", "::1"].contains(host.lowercased()) && settings.port == settings.localPort) else {
             throw UserFacingError("上游代理不能指向本工具自己的本机端口。")
         }
-        guard settings.expectedExitIP.isEmpty || isIPAddress(settings.expectedExitIP) else {
-            throw UserFacingError("预期出口请填写有效的 IP 地址；不需要固定出口时留空。")
-        }
-        guard settings.appPath.hasPrefix("/"), settings.appPath.hasSuffix(".app"),
-              !settings.appPath.contains("\n") else {
-            throw UserFacingError("请选择 Antigravity.app 的完整路径。")
-        }
         guard !settings.username.contains(":"), !settings.username.contains("\n"), !settings.username.contains("\r") else {
             throw UserFacingError("代理用户名不能包含冒号或换行。")
         }
-        _ = try RoutingPolicy(settings: settings)
+    }
+
+    static func validateSubscriptionURL(_ value: String) throws {
+        guard !value.isEmpty, !value.contains(where: { $0.isWhitespace || $0.isNewline }),
+              let components = URLComponents(string: value),
+              ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil, components.fragment == nil,
+              components.port.map({ (1...65535).contains($0) }) ?? true else {
+            throw UserFacingError("请填写完整的 HTTP/HTTPS 订阅链接，不要包含空格、账号密码或 # 片段。")
+        }
     }
 }

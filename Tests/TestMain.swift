@@ -3,7 +3,7 @@ import Darwin
 
 @main
 struct ModelTests {
-    static func main() throws {
+    static func main() async throws {
         var settings = ProxySettings()
         settings.server = "proxy.example.com"
         try SettingsValidator.validate(settings)
@@ -38,7 +38,15 @@ struct ModelTests {
         precondition(decoded == settings)
         try testSettingsMigration()
         try testRoutingPolicy()
+        try testProxyImport()
+        try testSubscriptionParser()
+        try testSubscriptionConfiguration()
+        try testSubscriptionUsage()
+        try testSubscriptionCatalog()
+        try testSubscriptionCurlRequest()
+        try testSubscriptionCache()
         precondition(!CoreInstaller.verifiedArchive(Data("modified archive".utf8)))
+        try await testInvalidCoreImport()
 
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AntigravityISP-tests-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -53,7 +61,51 @@ struct ModelTests {
         let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
         precondition(contents == updated)
         precondition(entries == ["settings.json"])
-        print("PASS: invalid configurations, self-proxy loop, password-free settings, legacy migration, routing guardrails/order, tampered core, private atomic writes")
+        print("PASS: invalid configurations, self-proxy loop, password-free settings, legacy migration, routing guardrails/order, proxy URL import, subscription parsing/config/usage/curl-config, invalid offline core rejection, private atomic writes")
+    }
+
+    private static func testProxyImport() throws {
+        let proxy = try ProxyImport("  socks5h://test%40user:p%3Aa%2Fss%25@[2001:db8::1]:1081/\n")
+        precondition(proxy.proxyType == "socks5" && proxy.server == "2001:db8::1" && proxy.port == 1081)
+        precondition(proxy.username == "test@user" && proxy.password == "p:a/ss%")
+        let local = try ProxyImport("127.0.0.1:7890")
+        precondition(local.proxyType == "http" && local.port == 7890 && local.username.isEmpty && local.password.isEmpty)
+        for (address, expectedPort) in [("http://proxy.example.com", 80), ("https://proxy.example.com", 443), ("socks5://proxy.example.com", 1080)] {
+            let imported = try ProxyImport(address)
+            precondition(imported.port == expectedPort && imported.server == "proxy.example.com")
+        }
+        for invalid in ["", " ", "ftp://proxy.example.com:21", "https://example.com/subscribe?token=test-only",
+                        "http://proxy.example.com#fragment", "http://proxy.example.com:0", "http://proxy.example.com:65536",
+                        "http://proxy.example.com:abc", "http://proxy.example.com\nother", "http://:password@proxy.example.com",
+                        "http://user%3Aname:password@proxy.example.com", "127.0.0.1:17898"] {
+            try expectFailure("Invalid proxy import accepted: \(invalid)") { _ = try ProxyImport(invalid) }
+        }
+    }
+
+    private static func testInvalidCoreImport() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AntigravityISP-core-test-" + UUID().uuidString)
+        let previousHome = ProcessInfo.processInfo.environment["ANTIGRAVITY_ISP_HOME"]
+        setenv("ANTIGRAVITY_ISP_HOME", directory.path, 1)
+        defer {
+            if let previousHome { setenv("ANTIGRAVITY_ISP_HOME", previousHome, 1) }
+            else { unsetenv("ANTIGRAVITY_ISP_HOME") }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let original = Data("existing executable must be preserved".utf8)
+        try AppPaths.writePrivate(original, to: AppPaths.mihomoExecutable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: AppPaths.mihomoExecutable.path)
+        let archive = directory.appendingPathComponent("invalid.gz")
+        try Data("not a core archive".utf8).write(to: archive)
+        do {
+            try await CoreInstaller.ensureInstalled(archive: archive, progress: { _ in })
+            throw UserFacingError("Unverified offline core was accepted")
+        } catch {
+            guard error.localizedDescription.contains("校验失败") else { throw error }
+        }
+        let installed = try Data(contentsOf: AppPaths.mihomoExecutable)
+        precondition(installed == original, "Failed imports must preserve the installed binary")
+        let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        precondition(!entries.contains(where: { $0.hasPrefix(".core-install-") }), "Failed imports must clean staging files")
     }
 
     private static func testSettingsMigration() throws {
@@ -77,13 +129,282 @@ struct ModelTests {
         precondition(fields["password"] == nil, "Migration must not introduce persisted passwords")
     }
 
+    private static func testSubscriptionParser() throws {
+        let yaml = """
+        # comment before the document
+        allow-lan: false
+        proxies:
+        - type: socks5
+          name: HK - 香港综合
+          server: example.com
+        - {name: "US - 纽约, 01", type: vmess, server: example.net}
+        - type: http
+          name: 'TW - 台湾''s'
+          ws-opts:
+            path: /
+        proxy-groups:
+          - name: 香港
+            type: select
+            proxies:
+              - HK - 香港综合
+        rules:
+          - MATCH,香港
+        """
+        let nodes = SubscriptionParser.nodes(in: yaml)
+        precondition(nodes == [
+            SubscriptionNode(name: "HK - 香港综合", type: "socks5"),
+            SubscriptionNode(name: "US - 纽约, 01", type: "vmess"),
+            SubscriptionNode(name: "TW - 台湾's", type: "http")
+        ], "Parser must read name/type from block and flow entries only: \(nodes)")
+        // A Base64-wrapped YAML subscription must normalize back to the same nodes.
+        let wrapped = Data(yaml.utf8).base64EncodedString()
+        precondition(SubscriptionParser.nodes(in: wrapped) == nodes, "Base64-wrapped YAML must be decoded")
+        // A node list with duplicates keeps the first occurrence and order.
+        let duplicates = """
+        proxies:
+        - name: Same
+          type: ss
+        - name: Same
+          type: ss
+        - name: Other
+          type: ss
+        """
+        precondition(SubscriptionParser.nodes(in: duplicates).map(\.name) == ["Same", "Other"])
+        // CRLF, BOM and URL-safe Base64 wrappers are all common in the wild.
+        precondition(SubscriptionParser.nodes(in: yaml.replacingOccurrences(of: "\n", with: "\r\n")) == nodes,
+                     "CRLF subscriptions must parse")
+        precondition(SubscriptionParser.nodes(in: "\u{FEFF}" + yaml) == nodes, "A leading BOM must be ignored")
+        let urlSafe = Data(yaml.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+        precondition(SubscriptionParser.nodes(in: urlSafe) == nodes, "URL-safe Base64 must be decoded")
+        // Comments are skipped; a quoted `#` is part of the name, a bare one is not.
+        let commented = """
+        proxies:
+        # region comment between entries
+        - name: "A #1" # real comment
+          type: ss
+          # nested comment
+        - name: B # trailing comment
+          type: vmess
+        # end of proxies
+        proxy-groups: []
+        """
+        precondition(SubscriptionParser.nodes(in: commented) == [
+            SubscriptionNode(name: "A #1", type: "ss"),
+            SubscriptionNode(name: "B", type: "vmess")
+        ], "Comments must not corrupt names: \(SubscriptionParser.nodes(in: commented))")
+        // A plain scalar may contain an apostrophe; the trailing comment is still stripped.
+        let apostrophe = """
+        proxies:
+        - name: It's a node # comment
+          type: ss
+        """
+        precondition(SubscriptionParser.nodes(in: apostrophe) == [SubscriptionNode(name: "It's a node", type: "ss")],
+                     "Apostrophes in plain names must not swallow comments")
+        // Flow-style sequences (single and multi line) list nodes too.
+        let flow = "proxies: [{name: A, type: ss}, {name: \"B, C\", type: vmess}]"
+        precondition(SubscriptionParser.nodes(in: flow) == [
+            SubscriptionNode(name: "A", type: "ss"),
+            SubscriptionNode(name: "B, C", type: "vmess")
+        ], "Flow-style node lists must parse")
+        let multilineFlow = """
+        proxies: [
+          {name: F1, type: ss},
+          {name: "F2", type: http, port: 1}
+        ]
+        proxy-groups: []
+        """
+        precondition(SubscriptionParser.nodes(in: multilineFlow).map(\.name) == ["F1", "F2"],
+                     "Multi-line flow-style node lists must parse")
+        // Comments inside a multi-line flow sequence must not swallow later nodes.
+        let commentedFlow = """
+        proxies: [ # start
+          {name: One, type: ss}, # first
+          # middle comment
+          {name: Two, type: http, ws-opts: {path: /x, headers: {Host: example.com}}}
+        ]
+        proxy-groups: []
+        """
+        precondition(SubscriptionParser.nodes(in: commentedFlow).map(\.name) == ["One", "Two"],
+                     "Comments inside flow sequences must be ignored")
+        // Detecting node content (used to accept styles the narrow parser cannot name).
+        precondition(SubscriptionParser.hasNodeEntries(in: apostrophe))
+        precondition(SubscriptionParser.hasNodeEntries(in: flow))
+        precondition(SubscriptionParser.hasNodeEntries(in: "proxies:\n  - &anchor {name: A, type: ss}"))
+        precondition(SubscriptionParser.hasNodeEntries(in: "proxies: # a comment\n- name: A\n  type: ss"))
+        for empty in ["", "proxies: []", "proxies: [ ]", "proxies: null", "proxies: ~",
+                      "proxies: [] # empty", "proxies: # only a comment",
+                      "rules: []\nproxies:"] {
+            precondition(!SubscriptionParser.hasNodeEntries(in: empty), "Unexpected node content: \(empty)")
+        }
+        // Content that is not a Clash/Mihomo YAML subscription yields no nodes.
+        for invalid in ["", "not a subscription", "<html></html>", "proxies: []"] {
+            precondition(SubscriptionParser.nodes(in: invalid).isEmpty, "Unexpected nodes for: \(invalid)")
+        }
+    }
+
+    private static func testSubscriptionConfiguration() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AntigravityISP-subscription-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let provider = directory.appendingPathComponent("subscription.yaml")
+        try Data("proxies: []\n".utf8).write(to: provider)
+
+        var settings = ProxySettings()
+        settings.useSubscription = true
+        settings.subscriptionUseManualProxy = false
+        settings.localPort = 17898
+        try SettingsValidator.validate(settings)
+        let providerConfiguration = try RelayConfiguration.make(
+            settings: settings, password: "ignored", subscriptionProviderPath: provider.path,
+            controllerSocket: directory.appendingPathComponent("controller.sock").path,
+            controllerSecret: "test-secret")
+        let subscriptionProvider = (providerConfiguration["proxy-providers"] as? [String: Any])?["SUBSCRIPTION"]
+            as? [String: Any]
+        precondition(subscriptionProvider?["type"] as? String == "file",
+                     "The subscription must load from the app-downloaded private file")
+        precondition(subscriptionProvider?["path"] as? String == provider.path)
+        precondition(subscriptionProvider?["url"] == nil, "The proxy core must not download the subscription")
+        let group = (providerConfiguration["proxy-groups"] as? [[String: Any]])?.first
+        precondition(group?["type"] as? String == "url-test", "Empty node selection must auto-select")
+        precondition(group?["use"] as? [String] == ["SUBSCRIPTION"])
+        precondition((group?["proxies"] as? [String])?.isEmpty == true,
+                     "The auto group must not contain a REJECT placeholder")
+        precondition((providerConfiguration["proxies"] as? [[String: Any]])?.isEmpty == true)
+        precondition(providerConfiguration["mixed-port"] as? Int == settings.localPort)
+        precondition(providerConfiguration["external-controller"] as? String == "")
+        precondition(providerConfiguration["external-controller-unix"] != nil)
+        // mihomo parses this file as YAML: JSON's default "\/" escapes break its parser.
+        let serialized = String(decoding: try RelayConfiguration.serialize(providerConfiguration), as: UTF8.self)
+        precondition(!serialized.contains("\\/"), "Generated config must not contain escaped slashes: \(serialized)")
+        precondition(serialized.contains("https://www.gstatic.com/generate_204"),
+                     "Provider health-check URL must keep real slashes")
+        let roundTrip = try JSONSerialization.jsonObject(
+            with: Data(serialized.utf8)) as? [String: Any]
+        precondition(roundTrip?["mixed-port"] as? Int == settings.localPort)
+        precondition(roundTrip?["proxy-providers"] != nil)
+
+        // A named node switches the group to an explicit selector.
+        settings.subscriptionNode = "HK - 香港综合"
+        let selected = try RelayConfiguration.make(
+            settings: settings, password: "", subscriptionProviderPath: provider.path,
+            controllerSocket: "/tmp/controller.sock", controllerSecret: "test-secret")
+        precondition((selected["proxy-groups"] as? [[String: Any]])?.first?["type"] as? String == "select")
+
+        // Missing/relative node files must fail before a relay is ever spawned.
+        let invalidProviderPaths: [String?] = [nil, "subscription.yaml"]
+        for path in invalidProviderPaths {
+            do {
+                _ = try RelayConfiguration.make(settings: settings, password: "",
+                    subscriptionProviderPath: path, controllerSocket: "/tmp/controller.sock",
+                    controllerSecret: "test-secret")
+                preconditionFailure("Missing subscription provider file was accepted")
+            } catch {}
+        }
+
+        // Manual mode keeps the single-proxy shape and never creates a provider.
+        settings.useSubscription = false
+        settings.subscriptionNode = ""
+        settings.server = "proxy.example.com"
+        let manual = try RelayConfiguration.make(settings: settings, password: "secret",
+            subscriptionProviderPath: nil, controllerSocket: "/tmp/controller.sock",
+            controllerSecret: "test-secret")
+        precondition(manual["proxy-providers"] == nil && manual["proxy-groups"] == nil)
+        precondition((manual["proxies"] as? [[String: Any]])?.count == 1)
+        precondition(manual["external-controller-unix"] == nil)
+    }
+
+    private static func testSubscriptionCatalog() throws {
+        let secretURL = "https://feed.example.com/c/secret-token"
+        let catalog = SubscriptionCatalog(
+            urlFingerprint: SubscriptionCatalog.fingerprint(secretURL),
+            nodes: [SubscriptionNode(name: "HK - 01", type: "ss")],
+            fetchedAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let encoded = String(decoding: try JSONEncoder().encode(catalog), as: UTF8.self)
+        precondition(!encoded.contains("secret-token"),
+                     "The persisted catalog must not contain the subscription URL/token")
+        precondition(encoded.contains(catalog.urlFingerprint))
+        precondition(SubscriptionCatalog.fingerprint(secretURL) != SubscriptionCatalog.fingerprint(secretURL + "x"))
+        let decoded = try JSONDecoder().decode(SubscriptionCatalog.self, from: Data(encoded.utf8))
+        precondition(decoded == catalog)
+    }
+
+    private static func testSubscriptionCache() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AntigravityISP-cache-" + UUID().uuidString, isDirectory: true)
+        let previousHome = ProcessInfo.processInfo.environment["ANTIGRAVITY_ISP_HOME"]
+        setenv("ANTIGRAVITY_ISP_HOME", home.path, 1)
+        defer {
+            if let previousHome { setenv("ANTIGRAVITY_ISP_HOME", previousHome, 1) }
+            else { unsetenv("ANTIGRAVITY_ISP_HOME") }
+            try? FileManager.default.removeItem(at: home)
+        }
+        let url = "https://feed.example.com/c/cache-token"
+        let yaml = Data("proxies:\n- {name: HK - 01, type: ss}\n".utf8)
+        SubscriptionCache.store(yaml: yaml, for: url, userInfo: "download=1; total=2")
+        let fresh = SubscriptionCache.load(for: url, maximumAge: SubscriptionCache.maximumAge)
+        precondition(fresh?.yaml == yaml, "A fresh cache must be readable")
+        precondition(fresh?.metadata.userInfo == "download=1; total=2")
+        precondition(SubscriptionCache.load(for: url, maximumAge: -1) == nil,
+                     "An expired cache must be ignored when a maximum age is required")
+        precondition(SubscriptionCache.load(for: "https://feed.example.com/c/other", maximumAge: nil) == nil,
+                     "The cache must be scoped to the subscription URL")
+        precondition(SubscriptionCache.load(for: url, maximumAge: nil) != nil,
+                     "A stale cache must still be available as a fallback")
+        // fetch() must serve a matching cache without touching the network.
+        let session = home.appendingPathComponent("session", isDirectory: true)
+        let snapshot = try SubscriptionFetcher.fetch(
+            url: url, proxy: nil, checkCancellation: {}, into: session,
+            useCache: true, progress: { _ in })
+        precondition(snapshot.nodes == [SubscriptionNode(name: "HK - 01", type: "ss")])
+        let written = try Data(contentsOf: SubscriptionFetcher.subscriptionYAMLURL(in: session))
+        precondition(written == yaml, "Cached YAML must be copied to the session directory")
+        SubscriptionCache.clear()
+        precondition(SubscriptionCache.load(for: url, maximumAge: nil) == nil)
+    }
+
+    private static func testSubscriptionCurlRequest() throws {
+        var settings = ProxySettings()
+        settings.proxyType = "https"
+        settings.server = "proxy.example.com"
+        settings.port = 8443
+        settings.username = "test-user"
+        let proxy = SubscriptionDownloadProxy(settings: settings, password: "p\"a\\ss")
+        let request = SubscriptionCurlRequest(url: "https://feed.example.com/c/token", proxy: proxy)
+        precondition(request.configText.contains("url = \"https://feed.example.com/c/token\""),
+                     "The URL must be written to the private curl config")
+        precondition(request.configText.contains("proxy = \"https://proxy.example.com:8443\""))
+        precondition(request.configText.contains("proxy-user = \"test-user:p\\\"a\\\\ss\""),
+                     "Proxy credentials must be escaped in the curl config value: \(request.configText)")
+        let plain = SubscriptionCurlRequest(url: "https://feed.example.com/c/token", proxy: nil)
+        precondition(plain.configText == "url = \"https://feed.example.com/c/token\"\n")
+        precondition(SubscriptionCurlRequest.escape("a\"b\\c\nd") == "a\\\"b\\\\c\\nd",
+                     "curl config quoting must escape quotes, backslashes and newlines")
+    }
+
+    private static func testSubscriptionUsage() throws {
+        let summary = SubscriptionUsage.summary(
+            fromUserInfo: "upload=100; download=2048; total=1073741824; expire=1893456000",
+            now: Date(timeIntervalSince1970: 1_700_000_000))
+        precondition(summary.contains("已用 2.1 KB / 1.0 GB"), "Unexpected usage summary: \(summary)")
+        precondition(summary.contains("有效期至"), "Usage summary must show the expiry: \(summary)")
+        let expired = SubscriptionUsage.summary(
+            fromUserInfo: "download=0; total=1024; expire=1000",
+            now: Date(timeIntervalSince1970: 1_700_000_000))
+        precondition(expired.contains("已过期"), "Expired subscriptions must be reported: \(expired)")
+        precondition(SubscriptionUsage.summary(fromUserInfo: "") == "")
+        precondition(SubscriptionUsage.summary(fromUserInfo: "total=0") == "")
+    }
+
     private static func testRoutingPolicy() throws {
         var settings = ProxySettings()
         settings.server = "proxy.example.com"
         let empty = try RoutingPolicy(settings: settings)
         precondition(empty.rules == [
-            "NETWORK,udp,REJECT", "DOMAIN,api.ipify.org,UPSTREAM",
-            "DOMAIN,www.cloudflare.com,UPSTREAM", "MATCH,UPSTREAM"
+            "NETWORK,udp,REJECT", "DOMAIN,api.ipify.org,UPSTREAM", "DOMAIN,www.cloudflare.com,UPSTREAM",
+            "DOMAIN,api.myip.com,UPSTREAM", "DOMAIN,ifconfig.me,UPSTREAM", "MATCH,UPSTREAM"
         ], "An empty allowlist must never generate DIRECT rules")
 
         settings.directDomains = [" Zeta.example.com\n", "alpha.example.com", "ALPHA.EXAMPLE.COM"]
@@ -93,6 +414,7 @@ struct ModelTests {
         precondition(routing.directDomainSuffixes == ["assets.example.org", "static.example.org"])
         precondition(routing.rules == [
             "NETWORK,udp,REJECT", "DOMAIN,api.ipify.org,UPSTREAM", "DOMAIN,www.cloudflare.com,UPSTREAM",
+            "DOMAIN,api.myip.com,UPSTREAM", "DOMAIN,ifconfig.me,UPSTREAM",
             "DOMAIN,alpha.example.com,DIRECT", "DOMAIN,zeta.example.com,DIRECT",
             "DOMAIN-SUFFIX,assets.example.org,DIRECT", "DOMAIN-SUFFIX,static.example.org,DIRECT", "MATCH,UPSTREAM"
         ], "UDP rejection, probe pinning, exact domains, suffixes and fallback must keep their order")
