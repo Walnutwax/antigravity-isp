@@ -7,6 +7,8 @@ import Foundation
 final class LauncherController {
     var onStatusChange: ((String, Bool) -> Void)?
     var onStopCompletion: ((Bool) -> Void)?
+    /// Reports the node catalog of a successful subscription relay so the picker can be refreshed.
+    var onSubscriptionNodes: (([String]) -> Void)?
     private(set) var isRunning = false
     var hasRunningApplication: Bool { application?.isTerminated == false }
     var canApplyRouting: Bool {
@@ -21,12 +23,12 @@ final class LauncherController {
     private var application: NSRunningApplication?
     private var stopping = false
 
-    func start(settings: ProxySettings, password: String) {
-        begin(settings: settings, password: password, launchApplication: true)
+    func start(settings: ProxySettings, password: String, subscriptionURL: String = "") {
+        begin(settings: settings, password: password, subscriptionURL: subscriptionURL, launchApplication: true)
     }
 
-    func test(settings: ProxySettings, password: String) {
-        begin(settings: settings, password: password, launchApplication: false)
+    func test(settings: ProxySettings, password: String, subscriptionURL: String = "") {
+        begin(settings: settings, password: password, subscriptionURL: subscriptionURL, launchApplication: false)
     }
 
     func applyRouting(_ routing: RoutingPolicy, persist: @escaping () throws -> Void) {
@@ -102,28 +104,33 @@ final class LauncherController {
         }
     }
 
-    private func begin(settings: ProxySettings, password: String, launchApplication: Bool) {
+    private func begin(settings: ProxySettings, password: String, subscriptionURL: String, launchApplication: Bool) {
         guard !isRunning && operationTask == nil && stopTask == nil else {
             report("已有启动、测试或应用会话，请先停止当前会话。", busy: true)
             return
         }
         do {
             try SettingsValidator.validate(settings)
+            if settings.useSubscription { try SettingsValidator.validateSubscriptionURL(subscriptionURL) }
             if launchApplication {
-                guard let bundle = Bundle(url: URL(fileURLWithPath: settings.appPath)),
-                      let executable = bundle.executableURL,
-                      FileManager.default.isExecutableFile(atPath: executable.path) else {
-                    throw RuntimeFailure("所选应用缺少可执行文件，请选择完整的 Antigravity.app。")
-                }
+                try Self.validateApplicationForLaunch(at: URL(fileURLWithPath: settings.appPath))
             }
-            try Self.requireApplicationClosed(at: URL(fileURLWithPath: settings.appPath))
         } catch {
             report(error.localizedDescription, busy: false)
             return
         }
         let token = RuntimeCancellation()
         cancellation = token
-        report(launchApplication ? "正在启动本地代理并检查出口…" : "正在测试代理连接…", busy: true)
+        let startedAt = Date()
+        report(settings.useSubscription ? "正在获取订阅…" : (launchApplication ? "正在启动本地代理并检查出口…" : "正在测试代理连接…"), busy: true)
+        let progress: @Sendable (String) -> Void = { [weak self] message in
+            Task { @MainActor [weak self] in
+                // Ignore a late progress hop once this operation has finished, so it
+                // cannot leave the UI stuck on a stale "busy" status.
+                guard let self, !self.stopping, self.operationTask != nil else { return }
+                self.report(message, busy: true)
+            }
+        }
         operationTask = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -131,13 +138,30 @@ final class LauncherController {
             }
             do {
                 let session = try await Task.detached(priority: .userInitiated) {
-                    try RelaySession.start(settings: settings, password: password, cancellation: token)
+                    try RelaySession.start(settings: settings, password: password, subscriptionURL: subscriptionURL,
+                                           progress: progress, cancellation: token)
                 }.value
                 self.relay = session
                 try token.check()
-                let exitIP = try await Task.detached(priority: .userInitiated) {
-                    try session.checkExitIP(expected: settings.expectedExitIP, cancellation: token)
-                }.value
+                if settings.useSubscription, !session.subscriptionNodes.isEmpty {
+                    self.onSubscriptionNodes?(session.subscriptionNodes)
+                }
+                let subscriptionStatus = session.subscriptionNodeCount > 0 ? "订阅 \(session.subscriptionNodeCount) 个节点 · " : ""
+                self.report(subscriptionStatus + "正在检查代理出口…", busy: true)
+                let exitIP: String
+                do {
+                    exitIP = try await Task.detached(priority: .userInitiated) {
+                        try session.checkExitIP(expected: settings.expectedExitIP, cancellation: token)
+                    }.value
+                } catch {
+                    if settings.useSubscription {
+                        let hint = settings.subscriptionNode.isEmpty
+                            ? "自动选择的节点无法连通。请在“节点”中手动选择一个可用节点后重试。"
+                            : "所选节点“\(settings.subscriptionNode)”无法连通。请在“节点”中换一个节点后重试。"
+                        throw RuntimeFailure("\(error.localizedDescription)\n\(hint)")
+                    }
+                    throw error
+                }
                 try token.check()
                 guard session.isAlive else { throw RuntimeFailure("本地代理在检查期间意外退出。") }
 
@@ -161,14 +185,14 @@ final class LauncherController {
                     }
                     self.operationTask = nil
                     self.cancellation = nil
-                    self.report("Antigravity 已启动 · 出口 IP：\(exitIP)", busy: true)
+                    self.report("Antigravity 已启动 · " + subscriptionStatus + "出口 IP：\(exitIP) · 耗时 \(Self.elapsed(since: startedAt)) 秒", busy: true)
                     self.startMonitoring()
                 } else {
                     await self.cleanRelay()
                     try token.check()
                     self.operationTask = nil
                     self.cancellation = nil
-                    self.report("测试成功 · 出口 IP：\(exitIP)", busy: false)
+                    self.report("测试成功 · " + subscriptionStatus + "出口 IP：\(exitIP) · 耗时 \(Self.elapsed(since: startedAt)) 秒", busy: false)
                 }
             } catch {
                 // stop() waits for this task, then handles any application returned
@@ -189,6 +213,10 @@ final class LauncherController {
                 }
             }
         }
+    }
+
+    private static func elapsed(since date: Date) -> String {
+        String(format: "%.1f", Date().timeIntervalSince(date))
     }
 
     private func finishRefusedStop() {
@@ -232,6 +260,13 @@ final class LauncherController {
         onStatusChange?(message, busy)
     }
 
+    static func validateApplicationForLaunch(at url: URL) throws {
+        guard ApplicationLocator.isApplication(at: url) else {
+            throw RuntimeFailure("所选应用缺少可执行文件，请选择完整的 Antigravity.app。")
+        }
+        try requireApplicationClosed(at: url)
+    }
+
     private static func requireApplicationClosed(at url: URL) throws {
         let normalized = url.resolvingSymlinksInPath().standardizedFileURL
         let identifier = Bundle(url: url)?.bundleIdentifier
@@ -242,7 +277,7 @@ final class LauncherController {
             return identifier != nil && app.bundleIdentifier == identifier
         }
         if existing {
-            throw RuntimeFailure("Antigravity 已在运行。请先正常退出，再通过本工具启动或测试；本工具不会结束已有应用。")
+            throw RuntimeFailure("Antigravity 已在运行。可以直接测试代理；启动前请先保存工作并正常退出 Antigravity，再通过本工具启动。")
         }
     }
 
@@ -317,6 +352,9 @@ final class RelaySession: @unchecked Sendable {
     private var lockDescriptor: Int32
     private var stopped = false
     private var routingRollbackFailed = false
+    private let controllerSecret = UUID().uuidString
+    private(set) var subscriptionNodeCount = 0
+    private(set) var subscriptionNodes: [String] = []
 
     var isAlive: Bool { process.isRunning }
     var canApplyRouting: Bool { !routingRollbackFailed && isAlive }
@@ -328,11 +366,13 @@ final class RelaySession: @unchecked Sendable {
         self.lockDescriptor = lockDescriptor
     }
 
-    static func start(settings: ProxySettings, password: String, cancellation: RuntimeCancellation) throws -> RelaySession {
+    static func start(settings: ProxySettings, password: String, subscriptionURL: String = "",
+                      progress: (@Sendable (String) -> Void)? = nil,
+                      cancellation: RuntimeCancellation) throws -> RelaySession {
         try cancellation.check()
         // Validate here as well as in the UI so every caller fails before spawning a relay.
         try SettingsValidator.validate(settings)
-        let routing = try RoutingPolicy(settings: settings)
+        if settings.useSubscription { try SettingsValidator.validateSubscriptionURL(subscriptionURL) }
         guard FileManager.default.isExecutableFile(atPath: AppPaths.mihomoExecutable.path) else {
             throw RuntimeFailure("未找到可执行的 Mihomo，请先安装代理内核。")
         }
@@ -349,6 +389,9 @@ final class RelaySession: @unchecked Sendable {
             close(descriptor)
             throw RuntimeFailure("另一个启动器会话正在运行，或运行锁不可用。")
         }
+        // A crashed launcher can leave a core process and its credential-bearing session
+        // directory behind; holding the exclusive lock means any such core is an orphan.
+        reconcileStaleSessions(progress: progress)
         let directory = AppPaths.runtimeDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
@@ -360,7 +403,28 @@ final class RelaySession: @unchecked Sendable {
         }
         let session = RelaySession(directory: directory, port: settings.localPort, lockDescriptor: descriptor)
         do {
-            try session.writeConfiguration(settings: settings, password: password, routing: routing)
+            // Fail fast on an occupied port instead of after a potentially slow download.
+            try session.requireFreePort()
+            // The subscription is downloaded by the app, not by the proxy core: on some
+            // networks the core's in-process TLS download stalls while curl succeeds.
+            var providerPath: String?
+            if settings.useSubscription {
+                let downloadProxy = settings.subscriptionUseManualProxy
+                    ? SubscriptionDownloadProxy(settings: settings, password: password) : nil
+                let snapshot = try SubscriptionFetcher.fetch(
+                    url: subscriptionURL, proxy: downloadProxy,
+                    checkCancellation: { try cancellation.check() },
+                    into: directory, progress: { progress?($0) })
+                session.subscriptionNodeCount = snapshot.nodes.count
+                providerPath = SubscriptionFetcher.subscriptionYAMLURL(in: directory).path
+                progress?("已读取 \(snapshot.nodes.count) 个节点，正在启动本地代理…")
+            }
+            let configuration = try RelayConfiguration.make(settings: settings, password: password,
+                subscriptionProviderPath: providerPath,
+                controllerSocket: directory.appendingPathComponent("controller.sock").path,
+                controllerSecret: session.controllerSecret)
+            try session.writeConfigurationData(RelayConfiguration.serialize(configuration), to: session.configURL)
+            // Re-check after the download: the port could have been taken while fetching.
             try session.requireFreePort()
             try cancellation.check()
             session.process.executableURL = AppPaths.mihomoExecutable
@@ -374,6 +438,9 @@ final class RelaySession: @unchecked Sendable {
             session.process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
             try session.process.run()
             try session.waitUntilListening(cancellation: cancellation)
+            if settings.useSubscription {
+                try session.waitForSubscription(node: settings.subscriptionNode, cancellation: cancellation)
+            }
             return session
         } catch {
             session.stop()
@@ -381,26 +448,88 @@ final class RelaySession: @unchecked Sendable {
         }
     }
 
-    private func writeConfiguration(settings: ProxySettings, password: String, routing: RoutingPolicy) throws {
-        var upstream: [String: Any] = [
-            "name": "UPSTREAM", "type": settings.proxyType == "socks5" ? "socks5" : "http",
-            "server": settings.server, "port": settings.port, "udp": false
-        ]
-        if settings.proxyType == "https" { upstream["tls"] = true }
-        if !settings.username.isEmpty {
-            upstream["username"] = settings.username
-            upstream["password"] = password
+    private func waitForSubscription(node: String, cancellation: RuntimeCancellation) throws {
+        let deadline = Date().addingTimeInterval(12)
+        var proxies: [[String: Any]] = []
+        var healthCheckDeadline: Date?
+        while Date() < deadline {
+            try cancellation.check()
+            guard isAlive else { throw RuntimeFailure("订阅代理启动失败，请检查内核版本和订阅格式。") }
+            if proxies.isEmpty,
+               let provider = try controllerRequest("/providers/proxies/SUBSCRIPTION", cancellation: cancellation),
+               let list = provider["proxies"] as? [[String: Any]], !list.isEmpty {
+                proxies = list
+                subscriptionNodes = list.compactMap { $0["name"] as? String }
+                subscriptionNodeCount = subscriptionNodes.count
+                healthCheckDeadline = Date().addingTimeInterval(1.5)
+            }
+            if !proxies.isEmpty {
+                if !node.isEmpty {
+                    guard subscriptionNodes.contains(node) else {
+                        throw RuntimeFailure("订阅中没有名为“\(node)”的节点。请在“节点”中重新选择，或点击“刷新节点”后再试。")
+                    }
+                    guard try controllerRequest("/proxies/UPSTREAM", body: ["name": node], cancellation: cancellation) != nil else {
+                        throw RuntimeFailure("无法选择指定的订阅节点，请重试。")
+                    }
+                    return
+                }
+                // Auto mode: the group is url-test, so it needs at least one finished
+                // health check. Return then and let the exit probe verify real traffic.
+                if proxies.contains(where: { hasSuccessfulHealthCheck($0) }) { return }
+                if let healthCheckDeadline, Date() >= healthCheckDeadline {
+                    // Some networks block the health-check URL even though the nodes work.
+                    // Keep an explicit selection as a fallback instead of leaving the
+                    // group without a target, then let the exit probe judge connectivity.
+                    if let group = try controllerRequest("/proxies/UPSTREAM", cancellation: cancellation),
+                       let selected = group["now"] as? String, !selected.isEmpty, selected != "REJECT" {
+                        return
+                    }
+                    if let first = subscriptionNodes.first,
+                       try controllerRequest("/proxies/UPSTREAM", body: ["name": first], cancellation: cancellation) != nil {
+                        return
+                    }
+                    return
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.2)
         }
-        let configuration: [String: Any] = [
-            "mixed-port": port, "port": 0, "socks-port": 0, "redir-port": 0, "tproxy-port": 0,
-            "allow-lan": false, "bind-address": "127.0.0.1", "ipv6": false,
-            "mode": "rule", "log-level": "silent", "external-controller": "",
-            "profile": ["store-selected": false, "store-fake-ip": false],
-            "tun": ["enable": false], "dns": ["enable": false],
-            "proxies": [upstream], "rules": routing.rules
-        ]
-        let data = try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
-        try writeConfigurationData(data, to: configURL)
+        guard subscriptionNodeCount > 0 else {
+            throw RuntimeFailure("订阅未能加载：代理内核没有解析出节点。请确认订阅为 Clash/Mihomo YAML 且未过期。")
+        }
+        // Fall through in auto mode: the exit IP check reports the concrete failure.
+    }
+
+    private func hasSuccessfulHealthCheck(_ proxy: [String: Any]) -> Bool {
+        guard let history = proxy["history"] as? [[String: Any]] else { return false }
+        return history.contains { ($0["delay"] as? Int ?? 0) > 0 }
+    }
+
+    private func controllerRequest(_ path: String, body: [String: String]? = nil,
+                                   cancellation: RuntimeCancellation) throws -> [String: Any]? {
+        let requestURL = directory.appendingPathComponent("controller-request.json")
+        let responseURL = directory.appendingPathComponent("controller-response.json")
+        let authURL = directory.appendingPathComponent("controller-auth.txt")
+        defer {
+            try? FileManager.default.removeItem(at: requestURL)
+            try? FileManager.default.removeItem(at: responseURL)
+            try? FileManager.default.removeItem(at: authURL)
+        }
+        try AppPaths.writePrivate(Data("header = \"Authorization: Bearer \(controllerSecret)\"\n".utf8), to: authURL)
+        try AppPaths.writePrivate(Data(), to: responseURL)
+        var arguments = ["-q", "--silent", "--fail", "--max-time", "2", "--max-filesize", "2097152",
+                         "--unix-socket", directory.appendingPathComponent("controller.sock").path,
+                         "--noproxy", "*", "--config", authURL.path,
+                         "--output", responseURL.path, "http://localhost" + path]
+        if let body {
+            try AppPaths.writePrivate(JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes]), to: requestURL)
+            arguments += ["--request", "PUT", "--header", "Content-Type: application/json", "--data-binary", "@" + requestURL.path]
+        }
+        let result = try RuntimeCommand.run(executable: "/usr/bin/curl", arguments: arguments,
+            timeout: 2.5, cancellation: cancellation, captureOutput: false, directory: directory)
+        guard result.status == 0 else { return nil }
+        let data = try Data(contentsOf: responseURL)
+        if data.isEmpty { return [:] }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
     func prepareRouting(_ routing: RoutingPolicy, cancellation: RuntimeCancellation) throws -> RelayRoutingUpdate {
@@ -411,7 +540,7 @@ final class RelaySession: @unchecked Sendable {
             throw RuntimeFailure("无法读取当前会话的配置，分流规则未更新。")
         }
         candidate["rules"] = routing.rules
-        let data = try JSONSerialization.data(withJSONObject: candidate, options: [.sortedKeys])
+        let data = try RelayConfiguration.serialize(candidate)
         let identifier = UUID().uuidString
         let update = RelayRoutingUpdate(
             candidate: directory.appendingPathComponent("routing-\(identifier).json"),
@@ -508,6 +637,60 @@ final class RelaySession: @unchecked Sendable {
         }
     }
 
+    /// Stops proxy cores orphaned by a crash/force-quit and removes their session
+    /// directories, so a stale relay can neither hold the local port nor keep credentials.
+    private static func reconcileStaleSessions(progress: (@Sendable (String) -> Void)?) {
+        var stoppedAny = false
+        let pids = runningCoreProcesses(executablePath: AppPaths.mihomoExecutable.path)
+        if !pids.isEmpty {
+            for pid in pids { kill(pid, SIGTERM) }
+            let deadline = Date().addingTimeInterval(2)
+            while Date() < deadline, pids.contains(where: { kill($0, 0) == 0 }) {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+            stoppedAny = pids.contains { kill($0, 0) != 0 }
+        }
+        var removedAny = false
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: AppPaths.runtimeDirectory, includingPropertiesForKeys: [.isDirectoryKey]) {
+            for entry in entries where UUID(uuidString: entry.lastPathComponent) != nil {
+                guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+                if (try? FileManager.default.removeItem(at: entry)) != nil { removedAny = true }
+            }
+        }
+        if stoppedAny {
+            progress?("已清理上次异常退出残留的本地代理。")
+        } else if removedAny {
+            progress?("已清理上次异常退出残留的临时配置。")
+        }
+    }
+
+    /// Compares real paths: `/tmp/x` and `/private/tmp/x` are the same file, and
+    /// `proc_pidpath` reports the resolved form.
+    static func resolvedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    }
+
+    private static func runningCoreProcesses(executablePath: String) -> [pid_t] {
+        let expected = resolvedPath(executablePath)
+        let needed = proc_listpids(1 /* PROC_ALL_PIDS */, 0, nil, 0)
+        guard needed > 0 else { return [] }
+        var pids = [pid_t](repeating: 0, count: Int(needed) / MemoryLayout<pid_t>.size + 64)
+        let written = proc_listpids(1, 0, &pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        guard written > 0 else { return [] }
+        let count = min(pids.count, Int(written) / MemoryLayout<pid_t>.size)
+        var matches: [pid_t] = []
+        for index in 0..<count {
+            let pid = pids[index]
+            guard pid > 0, pid != getpid() else { continue }
+            var buffer = [CChar](repeating: 0, count: 4096)
+            guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { continue }
+            if resolvedPath(String(cString: buffer)) == expected { matches.append(pid) }
+        }
+        return matches
+    }
+
     private func waitUntilListening(cancellation: RuntimeCancellation) throws {
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline {
@@ -533,35 +716,41 @@ final class RelaySession: @unchecked Sendable {
     }
 
     func checkExitIP(expected: String, cancellation: RuntimeCancellation) throws -> String {
-        let deadline = Date().addingTimeInterval(20)
+        guard isAlive else { throw RuntimeFailure("本地代理已退出。") }
+        // Probe every echo endpoint concurrently: the fastest usable answer wins, and a
+        // broken node fails in a few seconds instead of waiting out each endpoint in turn.
+        let probeCancellation = RuntimeCancellation()
+        let lock = NSLock()
         var detectedIP: String?
+        let firstAnswer = DispatchSemaphore(value: 0)
+        let group = DispatchGroup()
         for endpoint in RoutingPolicy.exitIPCheckEndpoints {
-            try cancellation.check()
-            guard isAlive else { throw RuntimeFailure("本地代理已退出。") }
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0.2 else { break }
-            let result = try RuntimeCommand.run(
-                executable: "/usr/bin/curl",
-                arguments: ["-q", "--silent", "--show-error", "--fail", "--connect-timeout", "8",
-                            "--max-time", String(format: "%.1f", remaining), "--max-filesize", "16384",
-                            "--proxy", "http://127.0.0.1:\(port)", "--noproxy", "", endpoint],
-                timeout: remaining + 0.5, cancellation: cancellation
-            )
-            guard result.status == 0 else { continue }
-            let value: String
-            if endpoint.contains("cloudflare") {
-                value = result.output.split(separator: "\n").first(where: { $0.hasPrefix("ip=") })
-                    .map { String($0.dropFirst(3)) } ?? ""
-            } else {
-                value = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            if let canonical = canonicalIP(value) {
-                detectedIP = canonical
-                break
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                defer { group.leave() }
+                guard let self,
+                      let value = try? self.probeExitIP(endpoint: endpoint, cancellation: probeCancellation),
+                      let canonical = canonicalIP(value) else { return }
+                lock.lock()
+                let isFirst = detectedIP == nil
+                if isFirst { detectedIP = canonical }
+                lock.unlock()
+                if isFirst { firstAnswer.signal() }
             }
         }
-        guard let detectedIP else {
-            throw RuntimeFailure("代理出口检查失败。请核对上游地址、端口、认证和网络连通性（超时 20 秒）。")
+        let deadline = Date().addingTimeInterval(12)
+        while Date() < deadline {
+            if firstAnswer.wait(timeout: .now() + 0.1) == .success { break }
+            try cancellation.check()
+        }
+        probeCancellation.cancel()
+        _ = group.wait(timeout: .now() + 2)
+        try cancellation.check()
+        lock.lock()
+        let resolvedIP = detectedIP
+        lock.unlock()
+        guard let detectedIP = resolvedIP else {
+            throw RuntimeFailure("代理出口检查失败：所有出口检测地址都无法通过代理访问。请核对节点、订阅和网络连通性。")
         }
         let trimmedExpected = expected.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedExpected.isEmpty {
@@ -573,6 +762,36 @@ final class RelaySession: @unchecked Sendable {
             }
         }
         return detectedIP
+    }
+
+    private func probeExitIP(endpoint: String, cancellation: RuntimeCancellation) throws -> String {
+        guard isAlive else { throw RuntimeFailure("本地代理已退出。") }
+        let result = try RuntimeCommand.run(
+            executable: "/usr/bin/curl",
+            arguments: ["-q", "--silent", "--show-error", "--fail", "--location", "--max-redirs", "2",
+                        "--connect-timeout", "4", "--max-time", "6",
+                        "--max-filesize", "16384",
+                        "--proxy", "http://127.0.0.1:\(port)", "--noproxy", "", endpoint],
+            timeout: 7, cancellation: cancellation
+        )
+        guard result.status == 0 else { throw RuntimeFailure("出口检测地址不可用。") }
+        let value = exitIPValue(from: result.output, endpoint: endpoint)
+        guard canonicalIP(value) != nil else { throw RuntimeFailure("出口检测结果无效。") }
+        return value
+    }
+
+    private func exitIPValue(from output: String, endpoint: String) -> String {
+        if endpoint.contains("cloudflare") {
+            return output.split(separator: "\n").first(where: { $0.hasPrefix("ip=") })
+                .map { String($0.dropFirst(3)) } ?? ""
+        }
+        if endpoint.contains("myip.com") {
+            guard let data = output.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let ip = object["ip"] as? String else { return "" }
+            return ip
+        }
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func stop() {
@@ -613,11 +832,13 @@ struct RelayRoutingUpdate: Sendable {
 
 private enum RuntimeCommand {
     static func run(executable: String, arguments: [String], timeout: TimeInterval,
-                    cancellation: RuntimeCancellation, captureOutput: Bool = true) throws -> (status: Int32, output: String) {
+                    cancellation: RuntimeCancellation, captureOutput: Bool = true,
+                    directory: URL? = nil) throws -> (status: Int32, output: String) {
         let process = Process()
         let output = captureOutput ? Pipe() : nil
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.currentDirectoryURL = directory
         process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = output as Any? ?? FileHandle.nullDevice
