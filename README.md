@@ -1,8 +1,8 @@
 # Antigravity ISP
 
-[English](README.en.md) · [下载 v0.3.0 预览版](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.3.0)
+[English](README.en.md) · [下载 v0.4.0 预览版](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.4.0)
 
-给 Antigravity 单独配置代理，一键启动，保持系统代理不变。支持带认证的远程 HTTP、HTTPS、SOCKS5 代理，并可指定公司域名走本机网络直连，无需先手动启动通用代理客户端。
+给 Antigravity 单独配置代理，一键启动，保持系统代理不变。支持 Clash/Mihomo 订阅和带认证的远程 HTTP、HTTPS、SOCKS5 代理，并可指定公司域名走本机网络直连，无需先手动启动通用代理客户端。
 
 这是一个原生 macOS 启动器。安装官方 Antigravity 并填写自己的上游代理后，它会管理本地转发进程，并带着对应代理设置启动 Antigravity。
 
@@ -36,7 +36,7 @@ Antigravity + 遵循代理设置的子进程
 
 - macOS 13 或更新版本。
 - 已单独安装的官方 Antigravity 应用（“Antigravity”与“Antigravity IDE”两个版本都支持；工具会自动检测，可在“启动应用”下拉框中切换，也可手动选择其它位置的 `.app`）。
-- 可用的 HTTP、HTTPS 或 SOCKS5 上游代理。
+- 可用的 Clash/Mihomo 订阅或 HTTP、HTTPS、SOCKS5 上游代理。
 - 首次安装代理内核时，本机网络需要能够访问 GitHub；这次下载不会通过尚未启动的本地转发。后续启动可使用已校验的本地内核。
 - 从源码构建需要 Xcode Command Line Tools，使用 `xcode-select --install` 安装。
 
@@ -76,17 +76,17 @@ open "dist/Antigravity ISP.app"
 
 “代理来源”选择“订阅链接”后：
 
-1. 粘贴完整的 HTTP/HTTPS 订阅地址（例如机场面板给出的 `https://feed.example.com/c/<id>` 形式）。
+1. 粘贴完整的订阅地址，例如 `https://feed.example.com/c/<id>`。含访问令牌的地址优先使用 HTTPS，跳转目标须使用 HTTPS。
 2. 点“刷新节点”。本工具会下载订阅、读出节点列表，并在“节点”下拉框中列出。
-3. 在“节点”中选择一个节点，或保留“自动选择（延迟最低）”，然后测试或启动。选择会在启动时随设置保存，下次打开仍可看到上次读取的节点列表。
+3. 在“节点”中选择一个节点，或保留“自动选择（延迟最低）”，然后测试或启动。自动选择可随测速结果切换节点。需要固定出口时，选择指定节点并填写预期出口 IP。启动时会保存选择，下次打开仍可看到上次读取的节点列表。
 
 订阅能力范围：
 
 - 支持 Clash/Mihomo YAML 订阅，包括整体被 Base64 编码的 YAML。
 - 不支持仅含节点链接（`vmess://`、`ss://` 等）或 SSR/V2Ray 原始列表的订阅；这类内容会明确报错，不会被当作可用节点。
-- 每次测试、启动和点“刷新节点”都会重新获取订阅；运行中的会话不按小时热更新节点。
+- “测试连接”和“启动”会复用有效期内的订阅缓存，“刷新节点”会重新下载。运行中的会话使用启动时的节点列表。
 - 订阅地址保存在钥匙串（account 为 `subscription`）；读到的节点名称保存在专用目录的 `subscription-nodes.json`（权限 `0600`，只写入订阅地址的指纹而不是地址本身，避免订阅令牌落盘）。
-- “刷新节点”期间“停止”按钮会变成“取消刷新”，可中断下载；最多重试 3 次，每次约 25 秒超时。
+- “刷新节点”期间“停止”按钮会变成“取消刷新”，可以中断下载。
 
 下载路径说明：订阅由本工具用 `curl` 下载后再交给内核，而不是让 Mihomo 在内核里自行下载。这样在内核直连 TLS 被网络卡住时仍可改用下方的手动代理下载；直连失败时，勾选“通过手动代理下载订阅（本机直连失败时）”并填写一个可用代理即可。
 
@@ -94,8 +94,8 @@ open "dist/Antigravity ISP.app"
 
 - 订阅下载使用 3 路并发、优先 IPv4 的方式，单轮失败会自动再试一轮；本机实测首次读取约 5 秒，失败时也能更快报错。
 - 成功下载的订阅会缓存 10 分钟（私有 `0600` 文件，按订阅地址指纹校验；缓存内容含节点配置，仅保存在本机，不进入仓库）。再次点“测试连接”或“启动”会直接复用缓存，本机实测约 2–3 秒完成。
-- 打开工具时会在后台预取一次订阅（仅在缓存缺失或过期时），让第一次点击不用等下载；缓存缺失或过期时“刷新节点”总是强制联网更新。
-- 出口 IP 检查改为 4 个检测地址并发，取最快成功的响应，正常约 1 秒内完成；失败时也不会再逐个地址等待。
+- 打开工具时，如果缓存缺失或过期，会在后台预取一次订阅。
+- 出口 IP 检查使用 4 个检测地址并发探测。
 - 测试/启动完成后的状态里会显示本次耗时。
 
 ## 公司内网与域名分流
@@ -112,7 +112,7 @@ open "dist/Antigravity ISP.app"
 进入本地 Mihomo 的请求按以下顺序匹配：
 
 1. UDP 请求使用 `REJECT`。
-2. 出口检测域名 `api.ipify.org`、`www.cloudflare.com`、`api.myip.com` 和 `ifconfig.me` 强制使用 `UPSTREAM`，不受直连配置影响；某个检测地址不可用时会自动换下一个。
+2. 出口检测域名 `api.ipify.org`、`www.cloudflare.com`、`api.myip.com` 和 `ifconfig.me` 强制使用 `UPSTREAM`，不受直连配置影响。
 3. 明确配置的精确域名和域名后缀使用 `DIRECT`。
 4. 其余请求使用 `MATCH,UPSTREAM`；上游连接失败时不回退到 `DIRECT`。
 
@@ -135,6 +135,8 @@ open "dist/Antigravity ISP.app"
 Mihomo 按 GPLv3 提供；其源码、许可证和版本对应关系见 [第三方声明](THIRD_PARTY_NOTICES.md)。本项目的 MIT 许可证只覆盖本项目自有代码与素材，不改变第三方组件的许可证。
 
 ## 验证状态
+
+v0.4.0 的变更和验证范围见 [发布说明](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.4.0)。订阅导入及双入口由 [PR #1](https://github.com/Walnutwax/antigravity-isp/pull/1) 合入。
 
 本机既有配置已实际验证公司内部服务直连与 Google 服务经上游代理可同时使用。这是本机分流路径的验证记录，不等同于 v0.2.0 公开 Swift 构建的整包真实 Antigravity 回归。
 
@@ -163,7 +165,7 @@ v0.2.0 已在 Apple Silicon 本机通过：
 
 **首次下载失败**：检查当前网络是否能访问 GitHub 官方发布资源，再重试。校验不匹配的内核不会被使用。
 
-**订阅获取失败**：本工具会自动重试 3 次。若提示直连失败，勾选“通过手动代理下载订阅（本机直连失败时）”并填写一个可用代理；确认订阅未过期、未被重置，且返回的是 Clash/Mihomo YAML。
+**订阅获取失败**：若提示直连失败，勾选“通过手动代理下载订阅（本机直连失败时）”并填写一个可用代理。确认订阅地址有效，返回 Clash/Mihomo YAML。
 
 **订阅节点无法连通**：“自动选择”依赖内核测速，个别节点被目标网站拦截时仍可能失败。点“刷新节点”后手动换一个节点再测试。
 
@@ -181,7 +183,7 @@ v0.2.0 已在 Apple Silicon 本机通过：
 
 ## 卸载
 
-先停止转发并退出启动器，再删除 `Antigravity ISP.app`。如需清除本工具保存的数据，删除 `~/Library/Application Support/AntigravityISP/`，并在“钥匙串访问”中删除 service 为 `io.github.antigravity-isp.proxy`、account 为 `default` 的密码项。
+先停止转发并退出启动器，再删除 `Antigravity ISP.app`。如需清除启动器保存的数据，删除 `~/Library/Application Support/AntigravityISP/`，并在“钥匙串访问”中删除服务为 `io.github.antigravity-isp.proxy`、账户为 `default` 和 `subscription` 的条目。
 
 这些是本工具专用的数据。保留官方 Antigravity 应用及其用户数据。
 

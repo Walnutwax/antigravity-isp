@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 /// One node parsed from a Clash/Mihomo subscription.
@@ -26,44 +27,52 @@ struct SubscriptionCatalog: Codable, Equatable, Sendable {
     }
 }
 
-/// Metadata for the on-disk subscription cache (the YAML body lives in a private file).
-struct SubscriptionCacheMetadata: Codable, Equatable, Sendable {
-    var urlFingerprint: String
-    var fetchedAt: Date
-    var userInfo: String
-}
-
-/// Reuses a recently downloaded subscription so repeated connection tests skip the
-/// network entirely, and falls back to a stale copy when the network is unreachable.
+/// Reuses a recent subscription when its source URL still matches.
 enum SubscriptionCache {
     static let maximumAge: TimeInterval = 10 * 60
 
-    static func load(for url: String, maximumAge: TimeInterval?,
-                     now: Date = Date()) -> (yaml: Data, metadata: SubscriptionCacheMetadata)? {
-        guard let metadataData = try? Data(contentsOf: AppPaths.subscriptionCacheMetadataFile),
-              let metadata = try? JSONDecoder().decode(SubscriptionCacheMetadata.self, from: metadataData),
-              metadata.urlFingerprint == SubscriptionCatalog.fingerprint(url),
-              let yaml = try? Data(contentsOf: AppPaths.subscriptionCacheFile), !yaml.isEmpty else {
+    struct Entry: Codable {
+        let urlFingerprint: String
+        let fetchedAt: Date
+        let userInfo: String
+        let yaml: Data
+    }
+
+    static func load(for url: String, maximumAge: TimeInterval, now: Date = Date()) -> Entry? {
+        guard let data = try? Data(contentsOf: AppPaths.subscriptionCacheFile),
+              let entry = try? PropertyListDecoder().decode(Entry.self, from: data),
+              entry.urlFingerprint == SubscriptionCatalog.fingerprint(url) else { return nil }
+        let age = now.timeIntervalSince(entry.fetchedAt)
+        guard age >= 0, age <= maximumAge,
+              !entry.yaml.isEmpty, entry.yaml.count <= SubscriptionFetcher.maximumBodyBytes,
+              let yaml = String(data: entry.yaml, encoding: .utf8),
+              SubscriptionParser.hasNodeEntries(in: yaml) else {
             return nil
         }
-        if let maximumAge, now.timeIntervalSince(metadata.fetchedAt) > maximumAge { return nil }
-        let text = String(decoding: yaml, as: UTF8.self)
-        guard SubscriptionParser.hasNodeEntries(in: text) else { return nil }
-        return (yaml, metadata)
+        return entry
     }
 
     static func store(yaml: Data, for url: String, userInfo: String, now: Date = Date()) {
-        // A cache write must never turn a successful test/launch into a failure.
-        let metadata = SubscriptionCacheMetadata(urlFingerprint: SubscriptionCatalog.fingerprint(url),
-                                                 fetchedAt: now, userInfo: userInfo)
-        guard let data = try? JSONEncoder().encode(metadata) else { return }
-        try? AppPaths.writePrivate(yaml, to: AppPaths.subscriptionCacheFile)
-        try? AppPaths.writePrivate(data, to: AppPaths.subscriptionCacheMetadataFile)
+        let entry = Entry(urlFingerprint: SubscriptionCatalog.fingerprint(url),
+                          fetchedAt: now, userInfo: userInfo, yaml: yaml)
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        // Publish the source and YAML together, even when downloads finish in parallel.
+        guard let data = try? encoder.encode(entry),
+              (try? AppPaths.writePrivate(data, to: AppPaths.subscriptionCacheFile)) != nil else { return }
+        removeLegacyFiles()
     }
 
     static func clear() {
-        try? FileManager.default.removeItem(at: AppPaths.subscriptionCacheFile)
-        try? FileManager.default.removeItem(at: AppPaths.subscriptionCacheMetadataFile)
+        _ = unlink(AppPaths.subscriptionCacheFile.path)
+        removeLegacyFiles()
+    }
+
+    private static func removeLegacyFiles() {
+        // The old cache wrote the YAML and fingerprint independently and cannot be migrated safely.
+        for file in AppPaths.legacySubscriptionCacheFiles {
+            _ = unlink(file.path)
+        }
     }
 
     static func ageDescription(_ fetchedAt: Date, now: Date = Date()) -> String {
@@ -99,7 +108,12 @@ struct SubscriptionCurlRequest: Equatable {
     let configText: String
 
     init(url: String, proxy: SubscriptionDownloadProxy?) {
-        var lines = ["url = \"\(Self.escape(url))\""]
+        var lines = [
+            "globoff",
+            "proto = \"=http,https\"",
+            "proto-redir = \"=https\"",
+            "url = \"\(Self.escape(url))\""
+        ]
         if let proxy {
             let scheme: String
             switch proxy.proxyType {
@@ -579,10 +593,10 @@ enum SubscriptionFetcher {
         }
         try AppPaths.createPrivateDirectory(directory)
         if useCache, let cached = SubscriptionCache.load(for: url, maximumAge: SubscriptionCache.maximumAge) {
-            progress("使用 \(SubscriptionCache.ageDescription(cached.metadata.fetchedAt))获取的订阅缓存，跳过下载…")
+            progress("使用 \(SubscriptionCache.ageDescription(cached.fetchedAt))获取的订阅缓存，跳过下载…")
             try AppPaths.writePrivate(cached.yaml, to: subscriptionYAMLURL(in: directory))
             let nodes = SubscriptionParser.nodes(in: String(decoding: cached.yaml, as: UTF8.self))
-            return SubscriptionSnapshot(nodes: nodes, userInfo: cached.metadata.userInfo)
+            return SubscriptionSnapshot(nodes: nodes, userInfo: cached.userInfo)
         }
         var lastFailure = ""
         var contentFailure: String?
@@ -606,12 +620,6 @@ enum SubscriptionFetcher {
             }
             if contentFailure != nil { break }
             if round < rounds { Thread.sleep(forTimeInterval: 0.5) }
-        }
-        if useCache, let stale = SubscriptionCache.load(for: url, maximumAge: nil) {
-            progress("订阅获取失败，改用 \(SubscriptionCache.ageDescription(stale.metadata.fetchedAt))的缓存…")
-            try AppPaths.writePrivate(stale.yaml, to: subscriptionYAMLURL(in: directory))
-            let nodes = SubscriptionParser.nodes(in: String(decoding: stale.yaml, as: UTF8.self))
-            return SubscriptionSnapshot(nodes: nodes, userInfo: stale.metadata.userInfo)
         }
         if let contentFailure {
             throw UserFacingError("无法使用该订阅：\(contentFailure)。请确认订阅地址返回的是 Clash/Mihomo YAML（可含 Base64 编码）。")
@@ -764,8 +772,7 @@ enum SubscriptionFetcher {
         try AppPaths.writePrivate(Data(request.configText.utf8), to: configURL)
         defer { try? FileManager.default.removeItem(at: configURL) }
         var arguments = ["-q", "--config", configURL.path,
-                         "--fail", "--silent", "--show-error", "--location", "--http1.1", "--compressed",
-                         "--proto", "=http,https", "--proto-redir", "=http,https",
+                         "--fail", "--silent", "--location", "--http1.1", "--compressed",
                          "--connect-timeout", "4", "--max-time", "14", "--max-redirs", "3",
                          "--max-filesize", String(maximumBodyBytes),
                          "--user-agent", "Clash.Meta/" + CoreInstaller.version,
@@ -780,8 +787,8 @@ enum SubscriptionFetcher {
         process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
+        // curl's diagnostics can include provider-controlled URLs or request details.
+        process.standardError = FileHandle.nullDevice
         try checkCancellation()
         try process.run()
         let deadline = Date().addingTimeInterval(30)
@@ -798,17 +805,25 @@ enum SubscriptionFetcher {
             terminate(process)
             throw error
         }
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0 else {
-            let message = String(data: errorOutput, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let detail = message.components(separatedBy: .newlines).last.map {
-                $0.trimmingCharacters(in: .whitespaces)
-            } ?? ""
-            return CurlOutcome(status: process.terminationStatus,
-                               message: detail.isEmpty ? "curl 退出码 \(process.terminationStatus)" : detail)
+        let status = process.terminationStatus
+        return CurlOutcome(status: status, message: curlFailureMessage(status))
+    }
+
+    private static func curlFailureMessage(_ status: Int32) -> String {
+        switch status {
+        case 0: return ""
+        case 1: return "订阅链接或重定向使用了不支持的协议"
+        case 5: return "无法解析下载代理的主机名"
+        case 6: return "无法解析订阅服务器的主机名"
+        case 7: return "无法建立网络连接"
+        case 22: return "订阅下载收到 HTTP 错误"
+        case 28: return "订阅下载超时"
+        case 35: return "TLS 连接失败"
+        case 47: return "订阅下载的重定向次数过多"
+        case 60: return "TLS 证书校验失败"
+        case 63: return "订阅内容超过 16 MB"
+        default: return "curl 退出码 \(status)"
         }
-        return CurlOutcome(status: 0, message: "")
     }
 
     /// Small cancellation flag used to stop sibling fetch workers; it lives here so this

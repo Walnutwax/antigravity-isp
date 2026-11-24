@@ -179,8 +179,10 @@ enum AppPaths {
     static var mihomoExecutable: URL { supportDirectory.appendingPathComponent("bin/mihomo") }
     static var settingsFile: URL { supportDirectory.appendingPathComponent("settings.json") }
     static var subscriptionCatalogFile: URL { supportDirectory.appendingPathComponent("subscription-nodes.json") }
-    static var subscriptionCacheFile: URL { supportDirectory.appendingPathComponent("subscription-cache.yaml") }
-    static var subscriptionCacheMetadataFile: URL { supportDirectory.appendingPathComponent("subscription-cache.json") }
+    static var subscriptionCacheFile: URL { supportDirectory.appendingPathComponent("subscription-cache-v1.plist") }
+    static var legacySubscriptionCacheFiles: [URL] {
+        ["subscription-cache.yaml", "subscription-cache.json"].map { supportDirectory.appendingPathComponent($0) }
+    }
 
     /// Removes partial subscription downloads left by a node refresh that was
     /// interrupted by quitting or crashing the launcher.

@@ -728,6 +728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         let proxy: SubscriptionDownloadProxy? = settings.subscriptionUseManualProxy
             ? SubscriptionDownloadProxy(settings: settings, password: passwordField.stringValue) : nil
+        let startedAt = Date()
         Task { [weak self] in
             guard let self else { return }
             let nodes = try? await Task.detached(priority: .utility) { () -> [SubscriptionNode] in
@@ -739,7 +740,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     useCache: true, progress: { _ in })
                 return snapshot.nodes
             }.value
-            guard let nodes, !nodes.isEmpty else { return }
+            guard let nodes, !nodes.isEmpty, !self.isBusy, self.subscriptionAddress == url else { return }
+            if let catalog = self.subscriptionCatalog, catalog.fetchedAt >= startedAt { return }
             self.storeSubscriptionNodes(nodes.map(\.name))
         }
     }

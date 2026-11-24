@@ -61,7 +61,7 @@ struct ModelTests {
         let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
         precondition(contents == updated)
         precondition(entries == ["settings.json"])
-        print("PASS: invalid configurations, self-proxy loop, password-free settings, legacy migration, routing guardrails/order, proxy URL import, subscription parsing/config/usage/curl-config, invalid offline core rejection, private atomic writes")
+        print("PASS: invalid configurations, self-proxy loop, password-free settings, legacy migration, routing guardrails/order, proxy URL import, subscription parsing/config/usage/curl-config/cache, invalid offline core rejection, private atomic writes")
     }
 
     private static func testProxyImport() throws {
@@ -342,27 +342,74 @@ struct ModelTests {
             try? FileManager.default.removeItem(at: home)
         }
         let url = "https://feed.example.com/c/cache-token"
+        let otherURL = "https://feed.example.com/c/other"
         let yaml = Data("proxies:\n- {name: HK - 01, type: ss}\n".utf8)
-        SubscriptionCache.store(yaml: yaml, for: url, userInfo: "download=1; total=2")
-        let fresh = SubscriptionCache.load(for: url, maximumAge: SubscriptionCache.maximumAge)
+        let otherYAML = Data("proxies:\n- {name: US - 01, type: ss}\n".utf8)
+        let userInfo = "download=1; total=2"
+        let now = Date()
+        let maximumAge = SubscriptionCache.maximumAge
+        // Simulate an old cache whose metadata and YAML came from different downloads.
+        let legacyMetadata = try JSONSerialization.data(withJSONObject: [
+            "urlFingerprint": SubscriptionCatalog.fingerprint(url),
+            "fetchedAt": now.timeIntervalSinceReferenceDate,
+            "userInfo": userInfo
+        ])
+        let legacyYAMLFile = home.appendingPathComponent("subscription-cache.yaml")
+        let legacyMetadataFile = home.appendingPathComponent("subscription-cache.json")
+        try AppPaths.writePrivate(otherYAML, to: legacyYAMLFile)
+        try AppPaths.writePrivate(legacyMetadata, to: legacyMetadataFile)
+        precondition(SubscriptionCache.load(for: url, maximumAge: maximumAge) == nil,
+                     "Unbound legacy cache contents must be ignored")
+
+        SubscriptionCache.store(yaml: yaml, for: url, userInfo: userInfo, now: now)
+        let fresh = SubscriptionCache.load(for: url, maximumAge: maximumAge, now: now)
         precondition(fresh?.yaml == yaml, "A fresh cache must be readable")
-        precondition(fresh?.metadata.userInfo == "download=1; total=2")
-        precondition(SubscriptionCache.load(for: url, maximumAge: -1) == nil,
-                     "An expired cache must be ignored when a maximum age is required")
-        precondition(SubscriptionCache.load(for: "https://feed.example.com/c/other", maximumAge: nil) == nil,
+        precondition(fresh?.userInfo == userInfo && fresh?.fetchedAt == now)
+        let entries = try FileManager.default.contentsOfDirectory(atPath: home.path)
+        precondition(entries == [AppPaths.subscriptionCacheFile.lastPathComponent],
+                     "The replacement must publish a single record and remove the old files")
+        let recordData = try Data(contentsOf: AppPaths.subscriptionCacheFile)
+        precondition(recordData.range(of: Data("cache-token".utf8)) == nil,
+                     "The record must not contain the subscription URL token")
+        let permissions = try FileManager.default.attributesOfItem(atPath: AppPaths.subscriptionCacheFile.path)
+        precondition(permissions[.posixPermissions] as? Int == 0o600, "The cache must be private")
+        precondition(SubscriptionCache.load(for: url, maximumAge: maximumAge,
+                                            now: now.addingTimeInterval(maximumAge)) != nil)
+        precondition(SubscriptionCache.load(for: url, maximumAge: maximumAge,
+                                            now: now.addingTimeInterval(maximumAge + 1)) == nil,
+                     "An expired cache must be ignored")
+        precondition(SubscriptionCache.load(for: url, maximumAge: maximumAge,
+                                            now: now.addingTimeInterval(-1)) == nil,
+                     "Clock rollback must not extend the cache lifetime")
+        precondition(SubscriptionCache.load(for: otherURL, maximumAge: maximumAge) == nil,
                      "The cache must be scoped to the subscription URL")
-        precondition(SubscriptionCache.load(for: url, maximumAge: nil) != nil,
-                     "A stale cache must still be available as a fallback")
         // fetch() must serve a matching cache without touching the network.
         let session = home.appendingPathComponent("session", isDirectory: true)
         let snapshot = try SubscriptionFetcher.fetch(
             url: url, proxy: nil, checkCancellation: {}, into: session,
             useCache: true, progress: { _ in })
         precondition(snapshot.nodes == [SubscriptionNode(name: "HK - 01", type: "ss")])
+        precondition(snapshot.userInfo == userInfo)
         let written = try Data(contentsOf: SubscriptionFetcher.subscriptionYAMLURL(in: session))
         precondition(written == yaml, "Cached YAML must be copied to the session directory")
+
+        let sources = [(url, yaml, userInfo), (otherURL, otherYAML, "total=3")]
+        DispatchQueue.concurrentPerform(iterations: 40) { index in
+            let (source, body, usage) = sources[index % sources.count]
+            SubscriptionCache.store(yaml: body, for: source, userInfo: usage, now: now)
+            for (source, body, usage) in sources {
+                if let entry = SubscriptionCache.load(for: source, maximumAge: maximumAge, now: now) {
+                    precondition(entry.yaml == body && entry.userInfo == usage,
+                                 "Concurrent writes must never bind a provider to another provider's data")
+                }
+            }
+        }
+        try AppPaths.writePrivate(Data("incomplete record".utf8), to: AppPaths.subscriptionCacheFile)
+        precondition(SubscriptionCache.load(for: url, maximumAge: maximumAge) == nil,
+                     "An incomplete cache must be ignored")
+        SubscriptionCache.store(yaml: yaml, for: url, userInfo: userInfo)
         SubscriptionCache.clear()
-        precondition(SubscriptionCache.load(for: url, maximumAge: nil) == nil)
+        precondition(SubscriptionCache.load(for: url, maximumAge: maximumAge) == nil)
     }
 
     private static func testSubscriptionCurlRequest() throws {
@@ -378,8 +425,18 @@ struct ModelTests {
         precondition(request.configText.contains("proxy = \"https://proxy.example.com:8443\""))
         precondition(request.configText.contains("proxy-user = \"test-user:p\\\"a\\\\ss\""),
                      "Proxy credentials must be escaped in the curl config value: \(request.configText)")
-        let plain = SubscriptionCurlRequest(url: "https://feed.example.com/c/token", proxy: nil)
-        precondition(plain.configText == "url = \"https://feed.example.com/c/token\"\n")
+        for scheme in ["http", "https"] {
+            let url = "\(scheme)://feed.example.com/c/token"
+            try SettingsValidator.validateSubscriptionURL(url)
+            let plain = SubscriptionCurlRequest(url: url, proxy: nil)
+            precondition(plain.configText == """
+                globoff
+                proto = "=http,https"
+                proto-redir = "=https"
+                url = "\(url)"
+
+                """, "Initial HTTP and HTTPS are allowed, with redirects restricted to HTTPS")
+        }
         precondition(SubscriptionCurlRequest.escape("a\"b\\c\nd") == "a\\\"b\\\\c\\nd",
                      "curl config quoting must escape quotes, backslashes and newlines")
     }

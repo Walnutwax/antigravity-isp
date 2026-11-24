@@ -1,8 +1,8 @@
 # Antigravity ISP
 
-[简体中文](README.md) · [Download v0.3.0 preview](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.3.0)
+[简体中文](README.md) · [Download v0.4.0 preview](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.4.0)
 
-Give Antigravity its own proxy and launch it in one click while keeping your system proxy settings unchanged. Supports authenticated remote HTTP, HTTPS, and SOCKS5 proxies, with optional direct routing for company domains through your Mac's network, without first starting a general-purpose proxy client yourself.
+Give Antigravity its own proxy and launch it in one click while keeping your system proxy settings unchanged. Supports Clash/Mihomo subscriptions and authenticated HTTP, HTTPS, and SOCKS5 proxies. Company domains can route directly through your Mac's network.
 
 This native macOS launcher manages the local relay and starts the official Antigravity application with the appropriate proxy settings. Install Antigravity separately and bring your own upstream proxy.
 
@@ -35,8 +35,8 @@ The exit IP is checked during connection tests and before application launch. Th
 ## Requirements
 
 - macOS 13 or later.
-- The official Antigravity application, installed separately.
-- A working HTTP, HTTPS, or SOCKS5 upstream proxy.
+- The official Antigravity App or Antigravity IDE, installed separately.
+- A working Clash/Mihomo subscription or an HTTP, HTTPS, or SOCKS5 upstream proxy.
 - Your Mac's current network must reach GitHub for the first core installation; the download does not use the local relay that has yet to start. Later launches can use the verified local core.
 - Xcode Command Line Tools for source builds; install with `xcode-select --install`.
 
@@ -59,8 +59,8 @@ Builds currently have only a local ad-hoc signature, with no Developer ID signin
 ## Configure and launch
 
 1. On first use, click “安装代理内核” (Install proxy core) and wait for the pinned Mihomo download and checksum verification. This step reaches GitHub using your Mac's current network.
-2. Select the installed Antigravity `.app` path.
-3. Enter your upstream protocol, server, and port; supply a username and password if required.
+2. Select the installed Antigravity App or Antigravity IDE. Use the custom application picker to select an `.app` at another location.
+3. Choose Subscription to import a Clash/Mihomo feed, or Manual Proxy to enter the upstream protocol, server, port, and any required credentials.
 4. Keep the default local port `17898`, or choose another unused port.
 5. Optionally enter an expected exit IP. Leave it empty to inspect the observed address without comparing it.
 6. If you need company network access, add direct domains in advanced settings as described below; otherwise leave both fields empty.
@@ -70,7 +70,18 @@ If Antigravity is already running, quit it normally before launching it here so 
 
 While Antigravity is running through the launcher, edit the two direct-domain fields in Advanced Settings and click 应用分流 (Apply Routing). The launcher validates the candidate configuration, saves the lists, and requests a reload in the same relay process. New rules apply to subsequent connections. Existing connections may keep their route until they reconnect. Stop the session before changing the upstream proxy, expected exit IP, or listening port.
 
-Remove proxy endpoints, usernames, and passwords before sharing screenshots or logs in public issues.
+Remove proxy endpoints, credentials, and subscription links before sharing screenshots or logs in public issues.
+
+## Subscriptions and node selection
+
+1. Paste the subscription URL and click “刷新节点” (Refresh Nodes).
+2. Choose a node or leave automatic latency-based selection enabled, then test the connection or start Antigravity.
+
+Automatic selection can switch nodes as their measured latency changes. For a fixed exit, select a named node and enter the expected exit IP.
+
+The launcher accepts Clash/Mihomo YAML, including Base64-encoded YAML. A feed consisting only of raw node links is unsupported. The launcher fetches the feed before starting Mihomo and can use the configured manual proxy for that download. Prefer HTTPS for feeds containing access tokens. Redirect targets must use HTTPS.
+
+Tests and launches reuse a private cache for up to 10 minutes. Refresh Nodes downloads a fresh copy and can be cancelled. The running relay uses the node list retrieved at session start. The subscription URL is kept in Keychain, and the private node catalog stores its SHA-256 fingerprint.
 
 ## Company networks and domain routing
 
@@ -86,7 +97,7 @@ Enter hostnames without schemes, paths, or wildcards. Add only company domains y
 Requests entering the local Mihomo relay match these rules in order:
 
 1. UDP requests use `REJECT`.
-2. Exit-check domains `api.ipify.org` and `www.cloudflare.com` always use `UPSTREAM`, regardless of direct-routing settings.
+2. Exit-check domains `api.ipify.org`, `www.cloudflare.com`, `api.myip.com`, and `ifconfig.me` always use `UPSTREAM`, regardless of direct-routing settings. Connection checks probe them in parallel.
 3. Explicitly configured exact domains and domain suffixes use `DIRECT`.
 4. All remaining requests use `MATCH,UPSTREAM`, with no fallback to `DIRECT` if the upstream fails.
 
@@ -102,13 +113,15 @@ Settings and runtime files are kept in a dedicated per-user directory:
 ~/Library/Application Support/AntigravityISP/
 ```
 
-Passwords are stored in macOS Keychain with service `io.github.antigravity-isp.proxy` and account `default`. Mihomo needs the credentials while running, so a temporary configuration is written with `0600` permissions and removed during normal stop or exit. Forced termination or a system crash can interrupt cleanup.
+Passwords and the subscription URL are stored in macOS Keychain under service `io.github.antigravity-isp.proxy`, using accounts `default` and `subscription` respectively. Temporary relay configurations and node files use `0600` permissions. Normal exit removes them, and the launcher checks its runtime directory for recoverable leftovers on the next start.
 
 After you click “安装代理内核” (Install proxy core), the launcher downloads the appropriate architecture from the [official Mihomo v1.19.34 release](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.34) and checks it against a SHA-256 value pinned in the code. The installed core lives in `bin/` under the directory above. Neither this repository nor the generated `.app` includes a Mihomo binary or real proxy credentials.
 
 Mihomo is provided under GPLv3. See [third-party notices](THIRD_PARTY_NOTICES.md) for its source, license, and pinned version. This project's MIT license covers its own code and artwork; it does not relicense third-party components.
 
 ## Validation status
+
+See the [v0.4.0 release notes](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.4.0) for the current test scope and downloads. [PR #1](https://github.com/Walnutwax/antigravity-isp/pull/1) added subscription import and support for both Antigravity apps.
 
 An existing local configuration has been exercised with direct access to an internal company service and simultaneous access to Google services through the upstream proxy. This verifies those local routes; it is not a full real-Antigravity regression test of the v0.2.0 public Swift build.
 
@@ -149,7 +162,7 @@ Prototype record: an earlier personal version was exercised with the real Antigr
 
 ## Uninstall
 
-Stop the relay and quit the launcher, then delete `Antigravity ISP.app`. To remove its saved data, delete `~/Library/Application Support/AntigravityISP/` and remove the password item with service `io.github.antigravity-isp.proxy` and account `default` using Keychain Access.
+Stop the relay and quit the launcher, then delete `Antigravity ISP.app`. To remove its saved data, delete `~/Library/Application Support/AntigravityISP/` and remove the Keychain items for service `io.github.antigravity-isp.proxy` and accounts `default` and `subscription` using Keychain Access.
 
 These belong exclusively to this launcher. Keep the official Antigravity application and its user data.
 

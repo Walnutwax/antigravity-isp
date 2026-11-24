@@ -343,7 +343,7 @@ final class RuntimeCancellation: @unchecked Sendable {
     }
 }
 
-/// No PID files or discovery of foreign processes are used for cleanup.
+/// Owns one proxy core and its private runtime directory.
 final class RelaySession: @unchecked Sendable {
     private let process = Process()
     private let stopLock = NSLock()
@@ -353,6 +353,7 @@ final class RelaySession: @unchecked Sendable {
     private var stopped = false
     private var routingRollbackFailed = false
     private let controllerSecret = UUID().uuidString
+    private var controllerSocket: URL?
     private(set) var subscriptionNodeCount = 0
     private(set) var subscriptionNodes: [String] = []
 
@@ -415,13 +416,13 @@ final class RelaySession: @unchecked Sendable {
                     url: subscriptionURL, proxy: downloadProxy,
                     checkCancellation: { try cancellation.check() },
                     into: directory, progress: { progress?($0) })
-                session.subscriptionNodeCount = snapshot.nodes.count
                 providerPath = SubscriptionFetcher.subscriptionYAMLURL(in: directory).path
+                session.controllerSocket = try Self.createControllerSocket(for: directory)
                 progress?("已读取 \(snapshot.nodes.count) 个节点，正在启动本地代理…")
             }
             let configuration = try RelayConfiguration.make(settings: settings, password: password,
                 subscriptionProviderPath: providerPath,
-                controllerSocket: directory.appendingPathComponent("controller.sock").path,
+                controllerSocket: session.controllerSocket?.path ?? "",
                 controllerSecret: session.controllerSecret)
             try session.writeConfigurationData(RelayConfiguration.serialize(configuration), to: session.configURL)
             // Re-check after the download: the port could have been taken while fetching.
@@ -450,53 +451,36 @@ final class RelaySession: @unchecked Sendable {
 
     private func waitForSubscription(node: String, cancellation: RuntimeCancellation) throws {
         let deadline = Date().addingTimeInterval(12)
-        var proxies: [[String: Any]] = []
         var healthCheckDeadline: Date?
         while Date() < deadline {
             try cancellation.check()
             guard isAlive else { throw RuntimeFailure("订阅代理启动失败，请检查内核版本和订阅格式。") }
-            if proxies.isEmpty,
-               let provider = try controllerRequest("/providers/proxies/SUBSCRIPTION", cancellation: cancellation),
+            if let provider = try controllerRequest("/providers/proxies/SUBSCRIPTION", cancellation: cancellation),
                let list = provider["proxies"] as? [[String: Any]], !list.isEmpty {
-                proxies = list
                 subscriptionNodes = list.compactMap { $0["name"] as? String }
                 subscriptionNodeCount = subscriptionNodes.count
-                healthCheckDeadline = Date().addingTimeInterval(1.5)
-            }
-            if !proxies.isEmpty {
                 if !node.isEmpty {
                     guard subscriptionNodes.contains(node) else {
                         throw RuntimeFailure("订阅中没有名为“\(node)”的节点。请在“节点”中重新选择，或点击“刷新节点”后再试。")
                     }
-                    guard try controllerRequest("/proxies/UPSTREAM", body: ["name": node], cancellation: cancellation) != nil else {
-                        throw RuntimeFailure("无法选择指定的订阅节点，请重试。")
-                    }
-                    return
-                }
-                // Auto mode: the group is url-test, so it needs at least one finished
-                // health check. Return then and let the exit probe verify real traffic.
-                if proxies.contains(where: { hasSuccessfulHealthCheck($0) }) { return }
-                if let healthCheckDeadline, Date() >= healthCheckDeadline {
-                    // Some networks block the health-check URL even though the nodes work.
-                    // Keep an explicit selection as a fallback instead of leaving the
-                    // group without a target, then let the exit probe judge connectivity.
                     if let group = try controllerRequest("/proxies/UPSTREAM", cancellation: cancellation),
-                       let selected = group["now"] as? String, !selected.isEmpty, selected != "REJECT" {
+                       group["now"] as? String == node {
                         return
                     }
-                    if let first = subscriptionNodes.first,
-                       try controllerRequest("/proxies/UPSTREAM", body: ["name": first], cancellation: cancellation) != nil {
-                        return
-                    }
-                    return
+                } else {
+                    // Give the automatic selector a short head start. The exit probe
+                    // still checks traffic when the health-check host is unavailable.
+                    if healthCheckDeadline == nil { healthCheckDeadline = Date().addingTimeInterval(1.5) }
+                    if list.contains(where: { hasSuccessfulHealthCheck($0) })
+                        || healthCheckDeadline.map({ Date() >= $0 }) == true { return }
                 }
             }
             Thread.sleep(forTimeInterval: 0.2)
         }
-        guard subscriptionNodeCount > 0 else {
+        guard !subscriptionNodes.isEmpty else {
             throw RuntimeFailure("订阅未能加载：代理内核没有解析出节点。请确认订阅为 Clash/Mihomo YAML 且未过期。")
         }
-        // Fall through in auto mode: the exit IP check reports the concrete failure.
+        throw RuntimeFailure("无法确认指定的订阅节点，请刷新节点后重试。")
     }
 
     private func hasSuccessfulHealthCheck(_ proxy: [String: Any]) -> Bool {
@@ -504,26 +488,20 @@ final class RelaySession: @unchecked Sendable {
         return history.contains { ($0["delay"] as? Int ?? 0) > 0 }
     }
 
-    private func controllerRequest(_ path: String, body: [String: String]? = nil,
-                                   cancellation: RuntimeCancellation) throws -> [String: Any]? {
-        let requestURL = directory.appendingPathComponent("controller-request.json")
+    private func controllerRequest(_ path: String, cancellation: RuntimeCancellation) throws -> [String: Any]? {
+        guard let controllerSocket else { return nil }
         let responseURL = directory.appendingPathComponent("controller-response.json")
         let authURL = directory.appendingPathComponent("controller-auth.txt")
         defer {
-            try? FileManager.default.removeItem(at: requestURL)
             try? FileManager.default.removeItem(at: responseURL)
             try? FileManager.default.removeItem(at: authURL)
         }
         try AppPaths.writePrivate(Data("header = \"Authorization: Bearer \(controllerSecret)\"\n".utf8), to: authURL)
         try AppPaths.writePrivate(Data(), to: responseURL)
-        var arguments = ["-q", "--silent", "--fail", "--max-time", "2", "--max-filesize", "2097152",
-                         "--unix-socket", directory.appendingPathComponent("controller.sock").path,
+        let arguments = ["-q", "--silent", "--fail", "--max-time", "2", "--max-filesize", "2097152",
+                         "--unix-socket", controllerSocket.path,
                          "--noproxy", "*", "--config", authURL.path,
                          "--output", responseURL.path, "http://localhost" + path]
-        if let body {
-            try AppPaths.writePrivate(JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes]), to: requestURL)
-            arguments += ["--request", "PUT", "--header", "Content-Type: application/json", "--data-binary", "@" + requestURL.path]
-        }
         let result = try RuntimeCommand.run(executable: "/usr/bin/curl", arguments: arguments,
             timeout: 2.5, cancellation: cancellation, captureOutput: false, directory: directory)
         guard result.status == 0 else { return nil }
@@ -640,26 +618,29 @@ final class RelaySession: @unchecked Sendable {
     /// Stops proxy cores orphaned by a crash/force-quit and removes their session
     /// directories, so a stale relay can neither hold the local port nor keep credentials.
     private static func reconcileStaleSessions(progress: (@Sendable (String) -> Void)?) {
-        var stoppedAny = false
-        let pids = runningCoreProcesses(executablePath: AppPaths.mihomoExecutable.path)
-        if !pids.isEmpty {
-            for pid in pids { kill(pid, SIGTERM) }
-            let deadline = Date().addingTimeInterval(2)
-            while Date() < deadline, pids.contains(where: { kill($0, 0) == 0 }) {
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-            for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
-            stoppedAny = pids.contains { kill($0, 0) != 0 }
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: AppPaths.runtimeDirectory, includingPropertiesForKeys: nil) else { return }
+        let directories = entries.filter {
+            UUID(uuidString: $0.lastPathComponent) != nil && isPrivateDirectory($0)
         }
+        guard !directories.isEmpty else { return }
+
+        // A relay must both run our binary and have a launcher session as its
+        // working directory. Other users of the same executable are left alone.
+        let paths = Set(directories.map { resolvedPath($0.path) })
+        let processes = runningCoreProcesses(in: paths)
+        for process in processes where process.isRunning { kill(process.pid, SIGTERM) }
+        waitForOrphans(processes, timeout: 2)
+        for process in processes where process.isRunning { kill(process.pid, SIGKILL) }
+        waitForOrphans(processes, timeout: 1)
+
+        let activePaths = Set(processes.filter(\.isRunning).map(\.directory))
         var removedAny = false
-        if let entries = try? FileManager.default.contentsOfDirectory(
-            at: AppPaths.runtimeDirectory, includingPropertiesForKeys: [.isDirectoryKey]) {
-            for entry in entries where UUID(uuidString: entry.lastPathComponent) != nil {
-                guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
-                if (try? FileManager.default.removeItem(at: entry)) != nil { removedAny = true }
-            }
+        for directory in directories where !activePaths.contains(resolvedPath(directory.path)) {
+            removeControllerSocket(for: directory)
+            if (try? FileManager.default.removeItem(at: directory)) != nil { removedAny = true }
         }
-        if stoppedAny {
+        if processes.contains(where: { !$0.isRunning }) {
             progress?("已清理上次异常退出残留的本地代理。")
         } else if removedAny {
             progress?("已清理上次异常退出残留的临时配置。")
@@ -672,23 +653,98 @@ final class RelaySession: @unchecked Sendable {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
-    private static func runningCoreProcesses(executablePath: String) -> [pid_t] {
-        let expected = resolvedPath(executablePath)
+    private static func waitForOrphans(_ processes: [OrphanedRelay], timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline, processes.contains(where: \.isRunning) {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
+    private static func runningCoreProcesses(in directories: Set<String>) -> [OrphanedRelay] {
+        let expected = resolvedPath(AppPaths.mihomoExecutable.path)
         let needed = proc_listpids(1 /* PROC_ALL_PIDS */, 0, nil, 0)
         guard needed > 0 else { return [] }
         var pids = [pid_t](repeating: 0, count: Int(needed) / MemoryLayout<pid_t>.size + 64)
         let written = proc_listpids(1, 0, &pids, Int32(pids.count * MemoryLayout<pid_t>.size))
         guard written > 0 else { return [] }
         let count = min(pids.count, Int(written) / MemoryLayout<pid_t>.size)
-        var matches: [pid_t] = []
+        var matches: [OrphanedRelay] = []
         for index in 0..<count {
             let pid = pids[index]
             guard pid > 0, pid != getpid() else { continue }
             var buffer = [CChar](repeating: 0, count: 4096)
-            guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { continue }
-            if resolvedPath(String(cString: buffer)) == expected { matches.append(pid) }
+            guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0,
+                  resolvedPath(String(cString: buffer)) == expected,
+                  let process = OrphanedRelay(pid: pid), directories.contains(process.directory) else { continue }
+            matches.append(process)
         }
         return matches
+    }
+
+    private struct OrphanedRelay {
+        let pid: pid_t
+        let directory: String
+        let startSeconds: UInt64
+        let startMicroseconds: UInt64
+
+        init?(pid: pid_t) {
+            guard let info = Self.processInfo(pid) else { return nil }
+            var paths = proc_vnodepathinfo()
+            let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &paths, size) == size else { return nil }
+            let cwd = withUnsafeBytes(of: paths.pvi_cdir.vip_path) { bytes in
+                String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            guard !cwd.isEmpty else { return nil }
+            self.pid = pid
+            directory = RelaySession.resolvedPath(cwd)
+            startSeconds = info.pbi_start_tvsec
+            startMicroseconds = info.pbi_start_tvusec
+        }
+
+        var isRunning: Bool {
+            guard let info = Self.processInfo(pid) else { return false }
+            return info.pbi_start_tvsec == startSeconds && info.pbi_start_tvusec == startMicroseconds
+        }
+
+        private static func processInfo(_ pid: pid_t) -> proc_bsdinfo? {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
+                  info.pbi_uid == getuid() else { return nil }
+            return info
+        }
+    }
+
+    /// Darwin's Unix socket address is limited to 104 bytes, so it may not fit
+    /// under Application Support. Mihomo resolves relative socket paths there too.
+    private static func controllerSocketDirectory(for session: URL) -> URL {
+        URL(fileURLWithPath: "/tmp/antigravity-isp-" + session.lastPathComponent, isDirectory: true)
+    }
+
+    private static func createControllerSocket(for session: URL) throws -> URL {
+        let directory = controllerSocketDirectory(for: session)
+        guard mkdir(directory.path, 0o700) == 0 else {
+            throw RuntimeFailure("无法创建订阅代理的私有控制目录。")
+        }
+        return directory.appendingPathComponent("controller.sock")
+    }
+
+    private static func removeControllerSocket(for session: URL) {
+        let directory = controllerSocketDirectory(for: session)
+        guard isPrivateDirectory(directory) else { return }
+        let socket = directory.appendingPathComponent("controller.sock")
+        var info = stat()
+        if lstat(socket.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFSOCK {
+            unlink(socket.path)
+        }
+        rmdir(directory.path)
+    }
+
+    private static func isPrivateDirectory(_ directory: URL) -> Bool {
+        var info = stat()
+        return lstat(directory.path, &info) == 0 && info.st_uid == getuid()
+            && (info.st_mode & S_IFMT) == S_IFDIR && (info.st_mode & 0o077) == 0
     }
 
     private func waitUntilListening(cancellation: RuntimeCancellation) throws {
@@ -724,6 +780,10 @@ final class RelaySession: @unchecked Sendable {
         var detectedIP: String?
         let firstAnswer = DispatchSemaphore(value: 0)
         let group = DispatchGroup()
+        defer {
+            probeCancellation.cancel()
+            _ = group.wait(timeout: .now() + 2)
+        }
         for endpoint in RoutingPolicy.exitIPCheckEndpoints {
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -740,11 +800,11 @@ final class RelaySession: @unchecked Sendable {
         }
         let deadline = Date().addingTimeInterval(12)
         while Date() < deadline {
-            if firstAnswer.wait(timeout: .now() + 0.1) == .success { break }
             try cancellation.check()
+            if firstAnswer.wait(timeout: .now() + 0.1) == .success || group.wait(timeout: .now()) == .success {
+                break
+            }
         }
-        probeCancellation.cancel()
-        _ = group.wait(timeout: .now() + 2)
         try cancellation.check()
         lock.lock()
         let resolvedIP = detectedIP
@@ -768,7 +828,8 @@ final class RelaySession: @unchecked Sendable {
         guard isAlive else { throw RuntimeFailure("本地代理已退出。") }
         let result = try RuntimeCommand.run(
             executable: "/usr/bin/curl",
-            arguments: ["-q", "--silent", "--show-error", "--fail", "--location", "--max-redirs", "2",
+            // Each probe hostname is pinned to UPSTREAM. A redirected hostname may be DIRECT.
+            arguments: ["-q", "--silent", "--show-error", "--fail",
                         "--connect-timeout", "4", "--max-time", "6",
                         "--max-filesize", "16384",
                         "--proxy", "http://127.0.0.1:\(port)", "--noproxy", "", endpoint],
@@ -809,6 +870,7 @@ final class RelaySession: @unchecked Sendable {
             }
             process.waitUntilExit()
         }
+        if controllerSocket != nil { Self.removeControllerSocket(for: directory) }
         try? FileManager.default.removeItem(at: directory)
         if lockDescriptor >= 0 {
             flock(lockDescriptor, LOCK_UN)

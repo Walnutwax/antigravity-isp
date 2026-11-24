@@ -226,6 +226,7 @@ struct RuntimeTests {
         let orphan = Process()
         orphan.executableURL = AppPaths.mihomoExecutable
         orphan.arguments = ["-d", stale.path, "-f", configURL.path]
+        orphan.currentDirectoryURL = stale
         orphan.standardOutput = FileHandle.nullDevice
         orphan.standardError = FileHandle.nullDevice
         try orphan.run()
@@ -234,6 +235,32 @@ struct RuntimeTests {
             orphan.waitUntilExit()
         }
         try waitForListener(port: port)
+
+        let staleController = URL(fileURLWithPath: "/tmp/antigravity-isp-" + stale.lastPathComponent, isDirectory: true)
+        try FileManager.default.createDirectory(at: staleController, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: staleController) }
+
+        let externalDirectory = AppPaths.supportDirectory.appendingPathComponent("independent-core-" + UUID().uuidString)
+        try AppPaths.createPrivateDirectory(externalDirectory)
+        defer { try? FileManager.default.removeItem(at: externalDirectory) }
+        let externalPort = try freePort()
+        var externalConfig = config
+        externalConfig["mixed-port"] = externalPort
+        let externalConfigURL = externalDirectory.appendingPathComponent("config.json")
+        try AppPaths.writePrivate(JSONSerialization.data(withJSONObject: externalConfig), to: externalConfigURL)
+        let independent = Process()
+        independent.executableURL = AppPaths.mihomoExecutable
+        independent.arguments = ["-d", externalDirectory.path, "-f", externalConfigURL.path]
+        independent.currentDirectoryURL = externalDirectory
+        independent.standardOutput = FileHandle.nullDevice
+        independent.standardError = FileHandle.nullDevice
+        try independent.run()
+        defer {
+            if independent.isRunning { kill(independent.processIdentifier, SIGKILL) }
+            independent.waitUntilExit()
+        }
+        try waitForListener(port: externalPort)
 
         var settings = try settings()
         settings.localPort = port
@@ -244,8 +271,11 @@ struct RuntimeTests {
                    "Orphaned session directory must be removed")
         try expect(!FileManager.default.fileExists(atPath: emptyStale.path),
                    "Abandoned session directory without a process must be removed")
+        try expect(!FileManager.default.fileExists(atPath: staleController.path),
+                   "Abandoned Unix controller directory must be removed")
         try expect(kill(orphan.processIdentifier, 0) != 0,
                    "Orphaned proxy core must be terminated")
+        try expect(independent.isRunning, "A separately launched process using the same executable must survive")
     }
 
     private static func waitForListener(port: Int) throws {

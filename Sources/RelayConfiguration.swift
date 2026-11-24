@@ -28,18 +28,25 @@ enum RelayConfiguration {
             configuration["secret"] = controllerSecret
             let provider: [String: Any] = [
                 "type": "file", "path": providerPath,
-                "exclude-type": "direct|reject|reject-drop|pass",
+                "exclude-type": "direct|reject|reject-drop|pass|dns|rematch",
                 "health-check": ["enable": true, "url": "https://www.gstatic.com/generate_204",
                                  "interval": 300, "timeout": 3000, "lazy": false]
             ]
             configuration["proxy-providers"] = ["SUBSCRIPTION": provider]
-            configuration["proxy-groups"] = [[
+            var upstream: [String: Any] = [
                 "name": "UPSTREAM",
                 "type": settings.subscriptionNode.isEmpty ? "url-test" : "select",
                 "proxies": [String](), "use": ["SUBSCRIPTION"],
                 "url": "https://www.gstatic.com/generate_204", "interval": 300,
-                "tolerance": 50, "lazy": false
-            ] as [String: Any]]
+                "tolerance": 50, "lazy": false, "empty-fallback": "REJECT"
+            ]
+            if !settings.subscriptionNode.isEmpty {
+                // Mihomo rebuilds selectors on reload and splits group filters at backticks.
+                let name = NSRegularExpression.escapedPattern(for: settings.subscriptionNode)
+                    .replacingOccurrences(of: "`", with: "\\x60")
+                upstream["filter"] = "\\A\(name)\\z"
+            }
+            configuration["proxy-groups"] = [upstream]
         } else {
             configuration["proxies"] = [manualProxy(settings, password: password, name: "UPSTREAM")]
         }

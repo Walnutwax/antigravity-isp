@@ -1,26 +1,34 @@
 # Changelog / 更新记录
 
-## v0.3.0 — Preview / 预览版
+## v0.4.0 — Preview / 预览版
 
 - Import Clash/Mihomo subscription URLs (including Base64-wrapped YAML), read the node list, and pick a node from a dropdown; keep "auto select lowest latency" as the default. The subscription URL is stored in the Keychain and the node catalog in a private `0600` file.
-- Download subscriptions with curl before starting the relay and hand the proxy core a local file provider, with three attempts and an optional manual download proxy. This fixes startup failures caused by the core's in-process TLS download stalling on some networks.
+- Download subscriptions with curl before starting the relay and hand the proxy core a local file provider. Downloads retry in parallel and can use a manual download proxy.
 - Add `api.myip.com` and `ifconfig.me` as pinned exit-IP probes, and report a concrete hint when an auto-selected or explicitly chosen node cannot connect.
 - Recover from a launcher crash/force-quit: before each start, stop orphaned proxy cores, remove their credential-bearing session directories, and free the local port; fail on an occupied port before downloading the subscription.
 - Make "刷新节点" cancellable (the Stop button becomes Cancel refresh) and clear partial refresh downloads on the next launch.
 - Store only a SHA-256 fingerprint of the subscription URL in the node catalog instead of the URL/token itself.
+- Cache the subscription fingerprint and node configuration in one atomic record. Limit reuse to 10 minutes and require HTTPS for subscription redirects.
+- Retain a named subscription node during routing reloads. Restrict orphan recovery to relay processes running from owned session directories.
 - Detect and switch between the installed Antigravity editions: the launcher now lists both "Antigravity" (`com.google.antigravity`) and "Antigravity IDE" (`com.google.antigravity-ide`) with their versions in a "启动应用" picker, keeps a custom `.app` fallback, and excludes third-party helpers such as Antigravity Tools. The selection is saved with the other settings.
 - Speed up connection checks: subscription downloads now race 3 concurrent curl workers with IPv4-first attempts, a successful subscription is cached for 10 minutes (private 0600 file keyed by URL fingerprint) and prefetched in the background at launch, exit-IP checks run the 4 probes concurrently, and the status line reports elapsed time. Local measurements: first check ≈5 s, cached checks ≈2–3 s (previously tens of seconds per click).
 - UI refresh: the connection status text now spans the full panel width instead of being squeezed into a narrow column; a segmented source switch, visible subscription URL, inline node picker + refresh button, larger action buttons, clearer status icon (success/error) and a stable default window size improve readability and reduce clicks.
-- Validate and reload direct-domain rules while Antigravity runs through the launcher. Save the updated lists for subsequent launches and apply the new rules to subsequent connections.
+
 - 支持导入 Clash/Mihomo 订阅链接（含 Base64 编码的 YAML），读取节点后可在“节点”下拉框中快捷选择；默认“自动选择延迟最低”。订阅地址保存在钥匙串，节点名称列表保存在权限 `0600` 的私有文件。
-- 订阅改由本工具用 curl 下载后再以本地文件方式交给内核，最多重试 3 次，并可选“通过手动代理下载订阅”；避免内核自行下载订阅时 TLS 卡住导致启动失败。
+- 订阅由本工具使用 curl 下载，再以本地文件交给内核。下载支持并发重试，也可以指定手动代理。
 - 出口检测新增 `api.myip.com` 和 `ifconfig.me`；自动选择或指定节点无法连通时给出更具体的提示。
 - 崩溃或强制退出后可自愈：每次启动前结束遗留的内核进程、删除含凭据的残留临时配置并释放端口；端口被占用时在下载订阅之前就报错。
 - “刷新节点”可取消（停止按钮会变成“取消刷新”），下次启动清理未完成的下载临时目录。
 - 节点目录只保存订阅地址的 SHA-256 指纹，不再把订阅地址/令牌写入磁盘。
+- 订阅缓存将地址指纹和节点配置一次写入，仅复用 10 分钟内的记录。订阅重定向要求使用 HTTPS。
+- 运行中重载分流时保留指定节点。异常退出恢复仅清理来自本工具专用会话目录的转发进程。
 - 支持 Antigravity 双版本：自动检测并列出已安装的“Antigravity”（`com.google.antigravity`）与“Antigravity IDE”（`com.google.antigravity-ide`）及版本号，可在“启动应用”下拉框切换，也保留“选择…”自定义 `.app`；不会把 Antigravity Tools 等第三方工具当作启动目标。选择会随设置保存。
 - 提速连接检查：订阅下载改为 3 路并发并优先 IPv4，成功后缓存 10 分钟（私有 0600 文件、按地址指纹校验），启动时后台预取；出口 IP 的 4 个地址并发探测，状态里显示耗时。本机实测首次约 5 秒、缓存后约 2–3 秒（此前每次点击常需数十秒）。
 - 界面优化：连接状态文案改为整行显示，不再被挤成窄条；代理来源改为分段切换，订阅地址可见，节点选择与“刷新节点”同行，操作按钮加大，状态图标区分成功/失败，默认窗口尺寸更适合单屏查看。
+
+## v0.3.0 — Preview / 预览版
+
+- Validate and reload direct-domain rules while Antigravity runs through the launcher. Save the updated lists for subsequent launches and apply the new rules to subsequent connections.
 - Antigravity 运行期间可验证并重载直连域名规则。更新后的名单会保存，新规则用于后续连接。
 
 ## v0.2.0 — Preview / 预览版
