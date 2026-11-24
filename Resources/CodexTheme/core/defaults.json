@@ -1,0 +1,5 @@
+{
+  "preset": "codex-pure-white",
+  "telemetryLayout": "detailed",
+  "telemetryCacheMode": "session"
+}

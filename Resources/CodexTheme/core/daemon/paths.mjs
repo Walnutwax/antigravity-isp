@@ -49,7 +49,7 @@ export function createBundleController({ portFile }) {
   function rebuildBundleIfNeeded() {
     if (state) return false;
 
-    const presetConfig = JSON.parse(readCoreFile('..', 'user', 'config.json'));
+    const presetConfig = JSON.parse(readCoreFile('defaults.json'));
     const preset = presetConfig.preset === 'codex-dark' ? 'codex-dark' : 'codex-pure-white';
     const telemetryLayout = presetConfig.telemetryLayout === 'detailed' ? 'detailed' : 'compact';
     const telemetryCacheMode = presetConfig.telemetryCacheMode === 'step' ? 'step' : 'session';
