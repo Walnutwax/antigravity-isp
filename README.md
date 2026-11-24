@@ -1,6 +1,6 @@
 # Antigravity ISP
 
-[English](README.en.md) · [下载 v0.4.0 预览版](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.4.0)
+[English](README.en.md) · [下载 v0.5.0 预览版](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.5.0)
 
 给 Antigravity 单独配置代理，一键启动，保持系统代理不变。支持 Clash/Mihomo 订阅和带认证的远程 HTTP、HTTPS、SOCKS5 代理，并可指定公司域名走本机网络直连，无需先手动启动通用代理客户端。
 
@@ -98,6 +98,14 @@ open "dist/Antigravity ISP.app"
 - 出口 IP 检查使用 4 个检测地址并发探测。
 - 测试/启动完成后的状态里会显示本次耗时。
 
+## Codex Theme、汉化与会话统计
+
+在“启动应用”中选择 Antigravity App，勾选“启用 Codex Theme、汉化和会话统计”，再通过本工具启动。主题默认关闭，启用时需要安装 Node.js 22.13 或更新版本。自动检测不到时，在启动器里填写 `node` 可执行文件的完整路径。Antigravity IDE 可继续使用代理功能。
+
+启用后，输入框下方会显示首字等待时间、上下文占用和输出速度。悬停统计栏，在“当前上下文”旁可以看到本会话已完成的压缩次数，包括正文已清理的历史压缩记录。
+
+主题由启动器管理，只连接这次启动的 Antigravity 的本机调试端口，并以只读方式读取本机的会话统计。它会随会话退出。版本和授权来源见 [第三方声明](THIRD_PARTY_NOTICES.md)。
+
 ## 公司内网与域名分流
 
 高级设置提供两个默认留空的字段，均支持逗号、空格或换行分隔多个域名：
@@ -135,6 +143,8 @@ open "dist/Antigravity ISP.app"
 Mihomo 按 GPLv3 提供；其源码、许可证和版本对应关系见 [第三方声明](THIRD_PARTY_NOTICES.md)。本项目的 MIT 许可证只覆盖本项目自有代码与素材，不改变第三方组件的许可证。
 
 ## 验证状态
+
+v0.5.0 的主题和统计支持见 [发布说明](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.5.0)。
 
 v0.4.0 的变更和验证范围见 [发布说明](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.4.0)。订阅导入及双入口由 [PR #1](https://github.com/Walnutwax/antigravity-isp/pull/1) 合入。
 

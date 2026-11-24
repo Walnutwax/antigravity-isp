@@ -1,6 +1,6 @@
 # Antigravity ISP
 
-[简体中文](README.md) · [Download v0.4.0 preview](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.4.0)
+[简体中文](README.md) · [Download v0.5.0 preview](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.5.0)
 
 Give Antigravity its own proxy and launch it in one click while keeping your system proxy settings unchanged. Supports Clash/Mihomo subscriptions and authenticated HTTP, HTTPS, and SOCKS5 proxies. Company domains can route directly through your Mac's network.
 
@@ -83,7 +83,16 @@ The launcher accepts Clash/Mihomo YAML, including Base64-encoded YAML. A feed co
 
 Tests and launches reuse a private cache for up to 10 minutes. Refresh Nodes downloads a fresh copy and can be cancelled. The running relay uses the node list retrieved at session start. The subscription URL is kept in Keychain, and the private node catalog stores its SHA-256 fingerprint.
 
+## Codex Theme, Chinese localization, and conversation stats
+
+Select the standalone Antigravity App in the launcher and enable Codex Theme, localization, and conversation stats before launching. This optional feature requires Node.js 22.13 or later. Leave the path blank for automatic discovery, or enter the absolute path of the Node.js executable. Antigravity IDE continues to use the proxy features.
+
+The bar below the message box shows time to first token, context usage, and output speed. Hover over it to see the number of completed compactions next to the current context. The count includes older completed checkpoints whose summaries have been pruned.
+
+The launcher manages the theme alongside Antigravity. The theme connects to the launched application's local debugging port and reads conversation statistics in read-only mode. See [third-party notices](THIRD_PARTY_NOTICES.md) for its source and license.
+
 ## Company networks and domain routing
+
 
 Advanced settings provide two fields, both empty by default. Separate multiple domains with commas, spaces, or line breaks:
 
@@ -120,6 +129,8 @@ After you click “安装代理内核” (Install proxy core), the launcher down
 Mihomo is provided under GPLv3. See [third-party notices](THIRD_PARTY_NOTICES.md) for its source, license, and pinned version. This project's MIT license covers its own code and artwork; it does not relicense third-party components.
 
 ## Validation status
+
+See the [v0.5.0 release notes](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.5.0) for the theme and statistics validation scope.
 
 See the [v0.4.0 release notes](https://github.com/Walnutwax/antigravity-isp/releases/tag/v0.4.0) for the current test scope and downloads. [PR #1](https://github.com/Walnutwax/antigravity-isp/pull/1) added subscription import and support for both Antigravity apps.
 

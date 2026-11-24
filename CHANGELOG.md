@@ -1,5 +1,10 @@
 # Changelog / 更新记录
 
+## v0.5.0 — Preview / 预览版
+
+- Add an optional launcher-managed Codex Theme for the standalone Antigravity App, including Chinese localization, time-to-first-token and context metrics, and a completed compaction count.
+- 公开版新增可选的 Codex Theme。Antigravity App 中可显示中文界面、首字等待、上下文占用和会话累计压缩次数。
+
 ## v0.4.0 — Preview / 预览版
 
 - Import Clash/Mihomo subscription URLs (including Base64-wrapped YAML), read the node list, and pick a node from a dropdown; keep "auto select lowest latency" as the default. The subscription URL is stored in the Keychain and the node catalog in a private `0600` file.

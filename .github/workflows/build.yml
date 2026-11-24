@@ -25,6 +25,11 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.arch }}"
       - name: Test
         run: ./scripts/test.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Test bundled theme
+        run: node --test Tests/ThemeTests.mjs
       - name: Build app
         run: ./scripts/build.sh
       - name: Package app

@@ -12,7 +12,7 @@ SWIFT_FLAGS=(-swift-version 5 -parse-as-library -target "$BUILD_ARCH-apple-macos
 xcrun swiftc "${SWIFT_FLAGS[@]}" Sources/Models.swift Sources/ProxyImport.swift Sources/CoreInstaller.swift Sources/RelayConfiguration.swift Sources/Subscription.swift Tests/TestMain.swift -o .build/model-tests
 .build/model-tests
 xcrun swiftc -swift-version 5 -module-cache-path "$PROJECT_DIR/.build/module-cache" Tests/FakeRelay.swift -o .build/fake-relay
-xcrun swiftc "${SWIFT_FLAGS[@]}" -framework Cocoa Sources/Models.swift Sources/CoreInstaller.swift Sources/RelayConfiguration.swift Sources/Subscription.swift Sources/ApplicationLocator.swift Sources/LauncherController.swift Tests/RuntimeTests.swift -o .build/runtime-tests
+xcrun swiftc "${SWIFT_FLAGS[@]}" -framework Cocoa Sources/Models.swift Sources/CoreInstaller.swift Sources/RelayConfiguration.swift Sources/Subscription.swift Sources/ApplicationLocator.swift Sources/LauncherController.swift Sources/ThemeSession.swift Tests/RuntimeTests.swift -o .build/runtime-tests
 FIXTURE_ARGS=()
 if [[ "${1:-}" == "--gui" ]]; then
   FIXTURE_DIR="$PROJECT_DIR/.build/ISP Test Application.app"

@@ -1,0 +1,12 @@
+Antigravity Codex Theme
+Repository: https://github.com/nkjDSLcvanv/antigravity-codex-theme
+Commit: 8d6730fff452dca554fbe152caa4b40c3d386285
+License: MIT (see LICENSE)
+
+This subset retains the Codex light and dark palettes, Simplified Chinese
+localization, and live status and conversation metrics. Antigravity ISP manages
+the daemon lifecycle and supplies the verified Stable DevToolsActivePort file.
+The managed daemon connects only to that loopback endpoint. Bundled changes
+limit daemon and renderer features to this subset and extend the telemetry
+tooltip to count completed and cleared checkpoint rows.
+Model matching treats Extra High and XHigh as equivalent effort labels.

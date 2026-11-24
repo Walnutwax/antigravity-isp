@@ -13,6 +13,8 @@ struct ProxySettings: Codable, Equatable {
     var useSubscription = false
     var subscriptionNode = ""
     var subscriptionUseManualProxy = false
+    var themeEnabled = false
+    var themeNodePath = ""
     var directDomains: [String] = []
     var directDomainSuffixes: [String] = []
 
@@ -21,6 +23,7 @@ struct ProxySettings: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case appPath, server, port, proxyType, username, localPort, expectedExitIP, autoStart
         case useSubscription, subscriptionNode, subscriptionUseManualProxy
+        case themeEnabled, themeNodePath
         case directDomains, directDomainSuffixes
     }
 
@@ -37,6 +40,8 @@ struct ProxySettings: Codable, Equatable {
         useSubscription = try values.decodeIfPresent(Bool.self, forKey: .useSubscription) ?? false
         subscriptionNode = try values.decodeIfPresent(String.self, forKey: .subscriptionNode) ?? ""
         subscriptionUseManualProxy = try values.decodeIfPresent(Bool.self, forKey: .subscriptionUseManualProxy) ?? false
+        themeEnabled = try values.decodeIfPresent(Bool.self, forKey: .themeEnabled) ?? false
+        themeNodePath = try values.decodeIfPresent(String.self, forKey: .themeNodePath) ?? ""
         // Version 0.1.0 did not persist routing exceptions.
         directDomains = try values.decodeIfPresent([String].self, forKey: .directDomains) ?? []
         directDomainSuffixes = try values.decodeIfPresent([String].self, forKey: .directDomainSuffixes) ?? []
@@ -251,6 +256,10 @@ enum SettingsValidator {
         guard settings.appPath.hasPrefix("/"), settings.appPath.hasSuffix(".app"),
               !settings.appPath.contains("\n") else {
             throw UserFacingError("请选择 Antigravity.app 的完整路径。")
+        }
+        guard settings.themeNodePath.isEmpty ||
+              (settings.themeNodePath.hasPrefix("/") && !settings.themeNodePath.contains(where: { $0.isNewline || $0 == "\0" })) else {
+            throw UserFacingError("请填写 Node.js 可执行文件的完整路径，或留空使用自动检测。")
         }
         _ = try RoutingPolicy(settings: settings)
     }

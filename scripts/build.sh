@@ -41,6 +41,7 @@ xcrun swiftc \
 
 cp Resources/Info.plist "$APP_DIR/Contents/Info.plist"
 cp LICENSE THIRD_PARTY_NOTICES.md "$APP_DIR/Contents/Resources/"
+cp -R Resources/CodexTheme "$APP_DIR/Contents/Resources/"
 printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
 xcrun swift -module-cache-path "$ROOT_DIR/.build/module-cache" \
   scripts/generate-icon.swift "$STAGING_DIR/AppIcon.iconset"

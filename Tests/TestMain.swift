@@ -113,6 +113,7 @@ struct ModelTests {
         let legacy = Data(#"{"appPath":"/Applications/Antigravity.app","server":"proxy.example.com","port":8443,"proxyType":"https","username":"test-user","localPort":17899,"expectedExitIP":"203.0.113.7","autoStart":true}"#.utf8)
         var settings = try JSONDecoder().decode(ProxySettings.self, from: legacy)
         precondition(settings.directDomains.isEmpty && settings.directDomainSuffixes.isEmpty)
+        precondition(!settings.themeEnabled && settings.themeNodePath.isEmpty, "Older settings must keep the theme optional")
         precondition(settings.server == "proxy.example.com" && settings.port == 8443)
         precondition(settings.username == "test-user" && settings.localPort == 17899)
         precondition(settings.proxyType == "https" && settings.expectedExitIP == "203.0.113.7" && settings.autoStart)
@@ -120,9 +121,11 @@ struct ModelTests {
 
         settings.directDomains = ["docs.example.com", "downloads.example.net"]
         settings.directDomainSuffixes = ["assets.example.org"]
+        settings.themeEnabled = true
+        settings.themeNodePath = "/usr/local/bin/node"
         let updated = try JSONEncoder().encode(settings)
         let roundTrip = try JSONDecoder().decode(ProxySettings.self, from: updated)
-        precondition(roundTrip == settings, "Routing exceptions must survive settings persistence")
+        precondition(roundTrip == settings, "Routing and theme settings must survive persistence")
         let fields = try JSONSerialization.jsonObject(with: updated) as! [String: Any]
         precondition(fields["directDomains"] as? [String] == settings.directDomains)
         precondition(fields["directDomainSuffixes"] as? [String] == settings.directDomainSuffixes)

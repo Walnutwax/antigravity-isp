@@ -21,13 +21,13 @@ private func expectFailure(_ fragment: String, _ body: () throws -> Void) throws
     throw TestFailure(message: "Expected failure containing: \(fragment)")
 }
 
-private func listener() throws -> (descriptor: Int32, port: Int) {
+private func listener(host: String = "127.0.0.1") throws -> (descriptor: Int32, port: Int) {
     let descriptor = socket(AF_INET, SOCK_STREAM, 0)
     guard descriptor >= 0 else { throw TestFailure(message: "socket failed") }
     var address = sockaddr_in()
     address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     address.sin_family = sa_family_t(AF_INET)
-    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+    address.sin_addr = in_addr(s_addr: inet_addr(host))
     let bound = withUnsafePointer(to: &address) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
             Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -75,10 +75,13 @@ struct RuntimeTests {
             try testCancellationAndFailure()
             try testRoutingReload()
             try testIPParsing()
+            try testThemeLaunchArguments()
+            try testThemeEndpointDiscovery()
+            try testThemeSession()
             if CommandLine.arguments.count > 2 {
                 try await testApplicationEnvironment(at: URL(fileURLWithPath: CommandLine.arguments[2]))
             }
-            print("Runtime tests passed: private config, authentication escaping, allowlist routing, upstream-pinned exit probes, UDP rejection, invalid-routing startup refusal, owned listener, session lock, occupied port, stale-relay recovery, application detection, cancellation, startup failure, routing reload and rollback, cleanup, IP parsing.")
+            print("Runtime tests passed: private config, authentication escaping, allowlist routing, upstream-pinned exit probes, UDP rejection, invalid-routing startup refusal, owned listener, session lock, occupied port, stale-relay recovery, application detection, cancellation, startup failure, routing reload and rollback, cleanup, IP parsing, desktop-only theme arguments, verified theme endpoint, and private theme lifecycle.")
         } catch {
             fputs("Runtime tests failed: \(error.localizedDescription)\n", stderr)
             exit(1)
@@ -416,6 +419,124 @@ struct RuntimeTests {
         for invalid in ["", "not-an-ip", "127.0.0.1:80", "999.1.2.3", "203.0.113.7\nextra"] {
             try expect(canonicalIP(invalid) == nil, "Reject invalid IP: \(invalid)")
         }
+    }
+
+    @MainActor
+    private static func testThemeLaunchArguments() throws {
+        let directory = AppPaths.supportDirectory.appendingPathComponent("theme-bundles-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for (id, supported) in [("com.google.antigravity", true), ("com.google.antigravity-ide", false),
+                                ("com.google.antigravity.preview", false), ("io.github.test-fixture", false)] {
+            let app = directory.appendingPathComponent(id + ".app")
+            let info = app.appendingPathComponent("Contents/Info.plist")
+            let data = try PropertyListSerialization.data(fromPropertyList: [
+                "CFBundleIdentifier": id, "CFBundlePackageType": "APPL"
+            ], format: .xml, options: 0)
+            try AppPaths.writePrivate(data, to: info)
+            try expect(ThemeSession.supportsApplication(at: app) == supported, "Theme scope for \(id)")
+            let disabled = LauncherController.applicationArguments(at: app, port: 17898, enableTheme: false)
+            try expect(disabled == ["--proxy-server=http://127.0.0.1:17898",
+                                    "--proxy-bypass-list=localhost;127.0.0.1;[::1]", "--disable-quic"],
+                       "Disabled theme must preserve the current proxy arguments")
+            let enabled = LauncherController.applicationArguments(at: app, port: 17898, enableTheme: true)
+            let debugging = ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]
+            try expect(enabled == (supported ? disabled + debugging : disabled),
+                       "Only the desktop bundle may enable loopback DevTools")
+        }
+    }
+
+    private static func testThemeEndpointDiscovery() throws {
+        let directory = AppPaths.supportDirectory.appendingPathComponent("theme-endpoint-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let portFile = directory.appendingPathComponent("DevToolsActivePort")
+        let owned = try listener()
+        defer { close(owned.descriptor) }
+        let wildcard = try listener(host: "0.0.0.0")
+        defer { close(wildcard.descriptor) }
+        let browserPath = "/devtools/browser/" + UUID().uuidString
+        let endpoint = "\(owned.port)\n\(browserPath)\n"
+        let token = RuntimeCancellation()
+        try AppPaths.writePrivate(Data(endpoint.utf8), to: portFile)
+        let discovery = ThemeEndpointDiscovery(portFile: portFile)
+        try expect(try discovery.verifiedEndpoint(applicationPID: getpid(), cancellation: token) == nil,
+                   "Stale file must be rejected even when this PID owns the recorded port")
+        try AppPaths.writePrivate(Data("\(wildcard.port)\n\(browserPath)\n".utf8), to: portFile)
+        try expect(try discovery.verifiedEndpoint(applicationPID: getpid(), cancellation: token) == nil,
+                   "Reject wildcard listeners on the owned PID")
+        try AppPaths.writePrivate(Data("1\n\(browserPath)\n".utf8), to: portFile)
+        try expect(try discovery.verifiedEndpoint(applicationPID: getpid(), cancellation: token) == nil,
+                   "A regular file alone cannot authorize a port")
+        try AppPaths.writePrivate(Data(endpoint.utf8), to: portFile)
+        try expect(try discovery.verifiedEndpoint(applicationPID: getppid(), cancellation: token) == nil,
+                   "Another PID may not authorize the recorded port")
+        try expect(try discovery.verifiedEndpoint(applicationPID: getpid(), cancellation: token) == endpoint,
+                   "An owned loopback listener and fresh file authorize just that endpoint")
+        let realFile = directory.appendingPathComponent("external")
+        try FileManager.default.moveItem(at: portFile, to: realFile)
+        try FileManager.default.createSymbolicLink(at: portFile, withDestinationURL: realFile)
+        try expect(try discovery.verifiedEndpoint(applicationPID: getpid(), cancellation: token) == nil,
+                   "Refuse a symbolic link to the DevTools port file")
+    }
+
+    private static func testThemeSession() throws {
+        let directory = AppPaths.supportDirectory.appendingPathComponent("theme-session-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let daemon = directory.appendingPathComponent("core/daemon.mjs")
+        let node = directory.appendingPathComponent("node")
+        let portFile = directory.appendingPathComponent("DevToolsActivePort")
+        let nodeFixture = """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+            printf '%s\n' v22.13.0
+            exit 0
+        fi
+        [ "$1" = "--import" ] && [ "$4" = "--channel" ] && [ "$5" = "stable" ] && [ "$6" = "--port-file" ] || exit 41
+        [ "$7" = "$TMPDIR/DevToolsActivePort" ] && [ -f "$7" ] || exit 42
+        [ "$(/usr/bin/stat -f '%Lp' "$TMPDIR")" = "700" ] && [ "$(/usr/bin/stat -f '%Lp' "$7")" = "600" ] || exit 43
+        [ "$HTTP_PROXY" = "$https_proxy" ] && [ "$ALL_PROXY" = "$all_proxy" ] && [ "$NO_PROXY" = "localhost,127.0.0.1,::1" ] || exit 44
+        printf '%s\n' "$HTTP_PROXY" "$ALL_PROXY" > "$TMPDIR/started"
+        exec /bin/sleep 30
+        """
+        try AppPaths.writePrivate(Data(), to: daemon)
+        try AppPaths.writePrivate(Data(nodeFixture.utf8), to: node)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: node.path)
+        try expect(!ThemeSession.supportsNodeVersion("v22.12.9") && !ThemeSession.supportsNodeVersion("v22.13.0-pre")
+                   && ThemeSession.supportsNodeVersion("v22.13.0") && ThemeSession.supportsNodeVersion("v24.0.0"),
+                   "Node requires stable 22.13.0 or newer")
+        let token = RuntimeCancellation()
+        let configuration = try ThemeSession.prepare(nodePath: node.path, cancellation: token, resourceDirectory: directory)
+        let relay = try RelaySession.start(settings: settings(), password: "", cancellation: token)
+        defer { relay.stop() }
+        let owned = try listener()
+        defer { close(owned.descriptor) }
+        let discovery = ThemeEndpointDiscovery(portFile: portFile)
+        let endpoint = "\(owned.port)\n/devtools/browser/\(UUID().uuidString)\n"
+        try AppPaths.writePrivate(Data(endpoint.utf8), to: portFile)
+        let session = try ThemeSession.start(configuration: configuration, discovery: discovery,
+                                             applicationPID: getpid(), relay: relay, cancellation: token)
+        defer { session.stop() }
+        let started = relay.themeDirectory.appendingPathComponent("started")
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, session.isAlive, !FileManager.default.fileExists(atPath: started.path) {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        try expect(session.isAlive, "Theme child must run with the private port file and proxy environment")
+        try expect(try String(contentsOf: started, encoding: .utf8) == "http://127.0.0.1:\(relay.port)\nsocks5h://127.0.0.1:\(relay.port)\n",
+                   "Theme child and app must receive the same per-app proxy")
+        try expect(try String(contentsOf: relay.themeDirectory.appendingPathComponent("DevToolsActivePort"), encoding: .utf8) == endpoint,
+                   "Private file must contain the verified endpoint")
+        session.stop()
+        try expect(!session.isAlive && relay.isAlive, "Stopping the optional theme must leave the relay alive")
+        try expect(!FileManager.default.fileExists(atPath: relay.themeDirectory.path), "Theme stop must clean its private directory")
+
+        let cancel = RuntimeCancellation()
+        let stale = ThemeEndpointDiscovery(portFile: portFile)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { cancel.cancel() }
+        try expectFailure("取消") {
+            _ = try ThemeSession.start(configuration: configuration, discovery: stale, applicationPID: getpid(),
+                                       relay: relay, cancellation: cancel)
+        }
+        try expect(!FileManager.default.fileExists(atPath: relay.themeDirectory.path), "Cancelled discovery must leave no theme directory")
     }
 
     @MainActor

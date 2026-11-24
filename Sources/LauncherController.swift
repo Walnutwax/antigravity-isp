@@ -2,7 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 
-/// Owns only the relay and application instance created by this launcher.
+/// Owns the application, relay and optional theme daemon created by this launcher.
 @MainActor
 final class LauncherController {
     var onStatusChange: ((String, Bool) -> Void)?
@@ -20,6 +20,7 @@ final class LauncherController {
     private var monitorTask: Task<Void, Never>?
     private var cancellation: RuntimeCancellation?
     private var relay: RelaySession?
+    private var theme: ThemeSession?
     private var application: NSRunningApplication?
     private var stopping = false
 
@@ -72,7 +73,8 @@ final class LauncherController {
         }
         stopping = true
         cancellation?.cancel()
-        monitorTask?.cancel()
+        let monitor = monitorTask
+        monitor?.cancel()
         monitorTask = nil
         report("正在停止，请等待应用正常退出…", busy: true)
         stopTask = Task { [weak self] in
@@ -80,6 +82,7 @@ final class LauncherController {
             if let operation = self.operationTask {
                 await operation.value
             }
+            if let monitor { await monitor.value }
             if let app = self.application, !app.isTerminated {
                 guard app.terminate() else {
                     self.finishRefusedStop()
@@ -95,7 +98,7 @@ final class LauncherController {
                 }
             }
             self.application = nil
-            await self.cleanRelay()
+            await self.cleanRuntime()
             self.cancellation = nil
             self.stopping = false
             self.stopTask = nil
@@ -167,28 +170,55 @@ final class LauncherController {
 
                 if launchApplication {
                     let appURL = URL(fileURLWithPath: settings.appPath)
+                    var themeStatus = ""
+                    var themeConfiguration: ThemeSession.Configuration?
+                    if settings.themeEnabled, ThemeSession.supportsApplication(at: appURL) {
+                        self.report("正在检查 Codex 主题运行环境…", busy: true)
+                        do {
+                            themeConfiguration = try await Task.detached(priority: .userInitiated) {
+                                try ThemeSession.prepare(nodePath: settings.themeNodePath, cancellation: token)
+                            }.value
+                        } catch {
+                            try token.check()
+                            themeStatus = " · Codex 主题未启用：\(error.localizedDescription)"
+                        }
+                    }
                     try Self.requireApplicationClosed(at: appURL)
+                    try token.check()
+                    guard session.isAlive else { throw RuntimeFailure("本地代理在启动应用前意外退出。") }
                     self.report("出口 IP：\(exitIP)，正在启动 Antigravity…", busy: true)
-                    let app = try await Self.openApplication(at: appURL, port: settings.localPort)
+                    let themeDiscovery = themeConfiguration.map { _ in ThemeEndpointDiscovery() }
+                    let app = try await Self.openApplication(at: appURL, port: settings.localPort,
+                                                             enableTheme: themeDiscovery != nil)
                     self.application = app
                     try token.check()
                     // Launch Services may return before Electron fails during startup.
                     for _ in 0..<15 {
                         try await Task.sleep(nanoseconds: 100_000_000)
                         try token.check()
-                        guard !app.isTerminated else {
-                            throw RuntimeFailure("Antigravity 启动后立即退出，请检查应用安装或应用自身的错误。")
+                        try Self.requireLaunchedSession(app, relay: session)
+                    }
+                    if let themeConfiguration, let themeDiscovery {
+                        self.report("正在启动 Codex 主题服务…", busy: true)
+                        let applicationPID = app.processIdentifier
+                        do {
+                            self.theme = try await Task.detached(priority: .userInitiated) {
+                                try ThemeSession.start(configuration: themeConfiguration, discovery: themeDiscovery,
+                                                       applicationPID: applicationPID, relay: session, cancellation: token)
+                            }.value
+                            themeStatus = " · Codex 主题服务已启动"
+                        } catch {
+                            themeStatus = " · Codex 主题未启用：\(error.localizedDescription)"
                         }
-                        guard session.isAlive else {
-                            throw RuntimeFailure("本地代理意外退出；Antigravity 仍在运行，请正常退出应用后重试。")
-                        }
+                        try token.check()
+                        try Self.requireLaunchedSession(app, relay: session)
                     }
                     self.operationTask = nil
                     self.cancellation = nil
-                    self.report("Antigravity 已启动 · " + subscriptionStatus + "出口 IP：\(exitIP) · 耗时 \(Self.elapsed(since: startedAt)) 秒", busy: true)
+                    self.report("Antigravity 已启动 · " + subscriptionStatus + "出口 IP：\(exitIP) · 耗时 \(Self.elapsed(since: startedAt)) 秒" + themeStatus, busy: true)
                     self.startMonitoring()
                 } else {
-                    await self.cleanRelay()
+                    await self.cleanRuntime()
                     try token.check()
                     self.operationTask = nil
                     self.cancellation = nil
@@ -205,13 +235,22 @@ final class LauncherController {
                     self.startMonitoring()
                 } else {
                     self.application = nil
-                    await self.cleanRelay()
+                    await self.cleanRuntime()
                     if self.stopping { return }
                     self.operationTask = nil
                     self.cancellation = nil
                     self.report(error.localizedDescription, busy: false)
                 }
             }
+        }
+    }
+
+    private static func requireLaunchedSession(_ app: NSRunningApplication, relay: RelaySession) throws {
+        guard !app.isTerminated else {
+            throw RuntimeFailure("Antigravity 在启动期间退出，请检查应用安装或应用自身的错误。")
+        }
+        guard relay.isAlive else {
+            throw RuntimeFailure("本地代理意外退出，Antigravity 仍在运行，请正常退出应用后重试。")
         }
     }
 
@@ -236,23 +275,36 @@ final class LauncherController {
                 guard self.operationTask == nil else { continue }
                 if self.application?.isTerminated != false {
                     self.application = nil
-                    await self.cleanRelay()
+                    await self.cleanRuntime()
+                    guard !Task.isCancelled, !self.stopping else { return }
                     self.cancellation = nil
                     self.report("应用已退出，临时代理配置已清理。", busy: false)
                     return
                 }
                 if let session = self.relay, !session.isAlive {
-                    await self.cleanRelay()
+                    await self.cleanRuntime()
+                    guard !Task.isCancelled, !self.stopping else { return }
                     self.report("本地代理意外退出；Antigravity 仍在运行，请退出应用后重新启动。", busy: true)
+                } else if let session = self.theme, !session.isAlive {
+                    self.theme = nil
+                    await Task.detached(priority: .userInitiated) { session.stop() }.value
+                    guard !Task.isCancelled, !self.stopping else { return }
+                    self.report("Codex 主题服务已退出。Antigravity 仍通过本地代理运行。", busy: true)
                 }
             }
         }
     }
 
-    private func cleanRelay() async {
-        guard let session = relay else { return }
+    private func cleanRuntime() async {
+        let themeSession = theme
+        let relaySession = relay
+        theme = nil
         relay = nil
-        await Task.detached(priority: .userInitiated) { session.stop() }.value
+        guard themeSession != nil || relaySession != nil else { return }
+        await Task.detached(priority: .userInitiated) {
+            themeSession?.stop()
+            relaySession?.stop()
+        }.value
     }
 
     private func report(_ message: String, busy: Bool) {
@@ -281,24 +333,12 @@ final class LauncherController {
         }
     }
 
-    static func openApplication(at url: URL, port: Int) async throws -> NSRunningApplication {
+    static func openApplication(at url: URL, port: Int, enableTheme: Bool = false) async throws -> NSRunningApplication {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.createsNewApplicationInstance = true
-        configuration.arguments = [
-            "--proxy-server=http://127.0.0.1:\(port)",
-            "--proxy-bypass-list=localhost;127.0.0.1;[::1]",
-            "--disable-quic"
-        ]
-        var environment = ProcessInfo.processInfo.environment
-        let httpProxy = "http://127.0.0.1:\(port)"
-        let socksProxy = "socks5h://127.0.0.1:\(port)"
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-            environment[key] = httpProxy
-        }
-        for key in ["ALL_PROXY", "all_proxy"] { environment[key] = socksProxy }
-        for key in ["NO_PROXY", "no_proxy"] { environment[key] = "localhost,127.0.0.1,::1" }
-        configuration.environment = environment
+        configuration.arguments = applicationArguments(at: url, port: port, enableTheme: enableTheme)
+        configuration.environment = proxyEnvironment(port: port, base: ProcessInfo.processInfo.environment)
         let requestedAt = Date()
         let app: NSRunningApplication = try await withCheckedThrowingContinuation { continuation in
             NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
@@ -317,9 +357,33 @@ final class LauncherController {
         }
         return app
     }
+
+    static func applicationArguments(at url: URL, port: Int, enableTheme: Bool) -> [String] {
+        var arguments = [
+            "--proxy-server=http://127.0.0.1:\(port)",
+            "--proxy-bypass-list=localhost;127.0.0.1;[::1]",
+            "--disable-quic"
+        ]
+        if enableTheme, ThemeSession.supportsApplication(at: url) {
+            arguments += ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]
+        }
+        return arguments
+    }
+
+    nonisolated static func proxyEnvironment(port: Int, base: [String: String]) -> [String: String] {
+        var environment = base
+        let httpProxy = "http://127.0.0.1:\(port)"
+        let socksProxy = "socks5h://127.0.0.1:\(port)"
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            environment[key] = httpProxy
+        }
+        for key in ["ALL_PROXY", "all_proxy"] { environment[key] = socksProxy }
+        for key in ["NO_PROXY", "no_proxy"] { environment[key] = "localhost,127.0.0.1,::1" }
+        return environment
+    }
 }
 
-private struct RuntimeFailure: LocalizedError {
+struct RuntimeFailure: LocalizedError {
     let message: String
     init(_ message: String) { self.message = message }
     var errorDescription: String? { message }
@@ -348,7 +412,7 @@ final class RelaySession: @unchecked Sendable {
     private let process = Process()
     private let stopLock = NSLock()
     private let directory: URL
-    private let port: Int
+    let port: Int
     private var lockDescriptor: Int32
     private var stopped = false
     private var routingRollbackFailed = false
@@ -358,6 +422,8 @@ final class RelaySession: @unchecked Sendable {
     private(set) var subscriptionNodes: [String] = []
 
     var isAlive: Bool { process.isRunning }
+    var processIdentifier: pid_t { process.processIdentifier }
+    var themeDirectory: URL { directory.appendingPathComponent("theme", isDirectory: true) }
     var canApplyRouting: Bool { !routingRollbackFailed && isAlive }
     private var configURL: URL { directory.appendingPathComponent("config.json") }
 
@@ -892,7 +958,7 @@ struct RelayRoutingUpdate: Sendable {
     }
 }
 
-private enum RuntimeCommand {
+enum RuntimeCommand {
     static func run(executable: String, arguments: [String], timeout: TimeInterval,
                     cancellation: RuntimeCancellation, captureOutput: Bool = true,
                     directory: URL? = nil) throws -> (status: Int32, output: String) {

@@ -50,6 +50,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var detectedApplications: [InstalledApplication] = []
     private var customApplicationPath = ""
     private let autoStartButton = NSButton(checkboxWithTitle: "打开本工具时自动启动 Antigravity", target: nil, action: nil)
+    private let themeButton = NSButton(checkboxWithTitle: "启用 Codex Theme、汉化和会话统计", target: nil, action: nil)
+    private let themeNodeField = NSTextField()
+    private var themeRuntimeFields: NSStackView!
     private let advancedButton = NSButton()
     private var advancedFields: NSStackView!
     private var editableControls: [NSControl] = []
@@ -473,7 +476,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         addFullWidth(appPathLabel, to: fields)
         autoStartButton.font = .systemFont(ofSize: 12)
         addFullWidth(formRow("", field: autoStartButton), to: fields)
-        editableControls.append(contentsOf: [browseButton, autoStartButton])
+        themeButton.font = .systemFont(ofSize: 12)
+        themeButton.target = self
+        themeButton.action = #selector(themeSelectionChanged)
+        themeButton.toolTip = "适用于 Antigravity App。下次启动时加载界面主题、中文和会话统计。"
+        addFullWidth(formRow("", field: themeButton), to: fields)
+        themeRuntimeFields = verticalStack(spacing: 8)
+        configureField(themeNodeField, placeholder: "留空自动检测 Node.js", accessibility: "Node.js 可执行文件路径")
+        addFullWidth(formRow("Node.js", field: themeNodeField), to: themeRuntimeFields)
+        let themeHint = NSTextField(wrappingLabelWithString:
+            "需要 Node.js 22.13 或更新版本。需要手动指定时，填写 node 可执行文件的完整路径。")
+        themeHint.font = .systemFont(ofSize: 11)
+        themeHint.textColor = .secondaryLabelColor
+        addFullWidth(themeHint, to: themeRuntimeFields)
+        addFullWidth(themeRuntimeFields, to: fields)
+        themeRuntimeFields.isHidden = true
+        editableControls.append(contentsOf: [browseButton, autoStartButton, themeButton])
         return panel(fields)
     }
 
@@ -553,6 +571,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         directDomainSuffixesField.stringValue = settings.directDomainSuffixes.joined(separator: ", ")
         refreshApplicationPopup(selectedPath: settings.appPath)
         autoStartButton.state = settings.autoStart ? .on : .off
+        themeButton.state = settings.themeEnabled ? .on : .off
+        themeNodeField.stringValue = settings.themeNodePath
         if !settings.expectedExitIP.isEmpty || settings.localPort != 17898
             || !settings.directDomains.isEmpty || !settings.directDomainSuffixes.isEmpty {
             setAdvancedVisible(true)
@@ -586,6 +606,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         settings.expectedExitIP = expectedExitIPField.stringValue.trimmingCharacters(in: trimming)
         settings.localPort = localPort
         settings.autoStart = autoStartButton.state == .on
+        settings.themeEnabled = themeButton.state == .on
+        settings.themeNodePath = themeNodeField.stringValue.trimmingCharacters(in: trimming)
         let routing = try readRouting()
         settings.directDomains = routing.directDomains
         settings.directDomainSuffixes = routing.directDomainSuffixes
@@ -933,6 +955,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         updateControls()
     }
 
+    @objc private func themeSelectionChanged() {
+        updateControls()
+    }
+
     @objc private func browseApplication() {
         let panel = NSOpenPanel()
         panel.title = "选择 Antigravity"
@@ -1041,6 +1067,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         saveButton.isEnabled = !busy
         testButton.isEnabled = !busy
         let selectedAppPath = selectedApplicationPath()
+        let supportsTheme = !selectedAppPath.isEmpty
+            && ThemeSession.supportsApplication(at: URL(fileURLWithPath: selectedAppPath))
+        themeButton.isEnabled = !busy && supportsTheme
+        themeRuntimeFields.isHidden = !supportsTheme || themeButton.state != .on
         let selectedApp = detectedApplications.first(where: { $0.url.path == selectedAppPath })
         let appShortName = selectedApp?.name ?? "Antigravity"
         launchButton.title = controller.hasRunningApplication ? "显示 \(appShortName)" : "启动 \(appShortName)"

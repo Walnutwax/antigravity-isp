@@ -21,6 +21,12 @@ The pinned source and upstream build configuration identify the code used for th
 
 The launcher's MIT license does not apply to Mihomo or alter its GPLv3 license. If you redistribute Mihomo, including by adding its binary to a modified application package, you must meet the applicable license requirements, including the requirements for providing the corresponding source. Review the upstream license and notices for the version you distribute.
 
+## Antigravity Codex Theme
+
+The optional interface enhancement bundles a subset of [nkjDSLcvanv/antigravity-codex-theme](https://github.com/nkjDSLcvanv/antigravity-codex-theme) at commit [`8d6730f`](https://github.com/nkjDSLcvanv/antigravity-codex-theme/commit/8d6730fff452dca554fbe152caa4b40c3d386285). The original copyright and MIT license are included in [Resources/CodexTheme/LICENSE](Resources/CodexTheme/LICENSE). Antigravity ISP manages the theme process and adds the completed-compaction display.
+
+The optional feature uses a separately installed Node.js runtime. Node.js is distributed separately by the [Node.js project](https://nodejs.org/).
+
 ## Antigravity and Apple platforms
 
 The official Antigravity application is installed separately and is not distributed by this project. Antigravity and other product names are the property of their respective owners. This project is not affiliated with or endorsed by those owners.
