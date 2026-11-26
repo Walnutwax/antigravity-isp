@@ -13,16 +13,24 @@ struct ProxySettings: Codable, Equatable {
     var useSubscription = false
     var subscriptionNode = ""
     var subscriptionUseManualProxy = false
+    var chainManualProxy = false
+    var useRelayURI = false
+    var splitChainedModelTraffic = false
     var themeEnabled = false
     var themeNodePath = ""
     var directDomains: [String] = []
     var directDomainSuffixes: [String] = []
+
+    var isChained: Bool {
+        (useSubscription && chainManualProxy) || (!useSubscription && useRelayURI)
+    }
 
     init() {}
 
     private enum CodingKeys: String, CodingKey {
         case appPath, server, port, proxyType, username, localPort, expectedExitIP, autoStart
         case useSubscription, subscriptionNode, subscriptionUseManualProxy
+        case chainManualProxy, useRelayURI, splitChainedModelTraffic
         case themeEnabled, themeNodePath
         case directDomains, directDomainSuffixes
     }
@@ -40,6 +48,9 @@ struct ProxySettings: Codable, Equatable {
         useSubscription = try values.decodeIfPresent(Bool.self, forKey: .useSubscription) ?? false
         subscriptionNode = try values.decodeIfPresent(String.self, forKey: .subscriptionNode) ?? ""
         subscriptionUseManualProxy = try values.decodeIfPresent(Bool.self, forKey: .subscriptionUseManualProxy) ?? false
+        chainManualProxy = try values.decodeIfPresent(Bool.self, forKey: .chainManualProxy) ?? false
+        useRelayURI = try values.decodeIfPresent(Bool.self, forKey: .useRelayURI) ?? false
+        splitChainedModelTraffic = try values.decodeIfPresent(Bool.self, forKey: .splitChainedModelTraffic) ?? false
         themeEnabled = try values.decodeIfPresent(Bool.self, forKey: .themeEnabled) ?? false
         themeNodePath = try values.decodeIfPresent(String.self, forKey: .themeNodePath) ?? ""
         // Version 0.1.0 did not persist routing exceptions.
@@ -65,22 +76,43 @@ struct RoutingPolicy {
         "https://api.myip.com", "https://ifconfig.me/ip"
     ]
 
+    private static let chainedModelDomains = [
+        "antigravity-hub-auto-updater-974169037036.us-central1.run.app",
+        "antigravity-ide-auto-updater-974169037036.us-central1.run.app"
+    ]
+    private static let chainedModelDomainSuffixes = [
+        "ai.dev", "aiplatform.goog", "anthropic.com", "antigravity-unleash.goog",
+        "antigravity.goog", "antigravity.google", "appspot.com",
+        "chatgpt.com", "claude.ai", "cloud.goog", "deepmind.google", "ggpht.com",
+        "google.com", "google.dev", "googleapis.com", "googleusercontent.com",
+        "googlevideo.com", "gstatic.com", "gvt1.com", "gvt2.com",
+        "openai.com", "pki.goog", "withgoogle.com"
+    ]
+
     let directDomains: [String]
     let directDomainSuffixes: [String]
+    let splitChainedModelTraffic: Bool
 
     init(settings: ProxySettings) throws {
         directDomains = try Self.normalize(settings.directDomains, group: "精确直连域名")
         directDomainSuffixes = try Self.normalize(settings.directDomainSuffixes, group: "直连域名后缀")
+        splitChainedModelTraffic = settings.isChained && settings.splitChainedModelTraffic
     }
 
     var rules: [String] {
         // UDP must not fall through an unsupported upstream into a DIRECT rule.
         // Pin the probes before user exceptions so the reported exit always tests UPSTREAM.
-        ["NETWORK,udp,REJECT"]
-            + Self.exitIPProbeHosts.map { "DOMAIN,\($0),UPSTREAM" }
-            + directDomains.map { "DOMAIN,\($0),DIRECT" }
+        let base = ["NETWORK,udp,REJECT"] + Self.exitIPProbeHosts.map { "DOMAIN,\($0),UPSTREAM" }
+        let direct = directDomains.map { "DOMAIN,\($0),DIRECT" }
             + directDomainSuffixes.map { "DOMAIN-SUFFIX,\($0),DIRECT" }
-            + ["MATCH,UPSTREAM"]
+        if splitChainedModelTraffic {
+            // Three-way chained mode: model/AI domains go through UPSTREAM (RELAY -> landing proxy),
+            // explicit direct domains go DIRECT, and all remaining traffic goes through RELAY.
+            let model = Self.chainedModelDomains.map { "DOMAIN,\($0),UPSTREAM" }
+                + Self.chainedModelDomainSuffixes.map { "DOMAIN-SUFFIX,\($0),UPSTREAM" }
+            return base + model + direct + ["MATCH,RELAY"]
+        }
+        return base + direct + ["MATCH,UPSTREAM"]
     }
 
     private static func normalize(_ entries: [String], group: String) throws -> [String] {
@@ -240,10 +272,10 @@ enum SettingsValidator {
     }
 
     static func validate(_ settings: ProxySettings) throws {
-        if !settings.useSubscription || settings.subscriptionUseManualProxy {
+        if !settings.useSubscription || settings.subscriptionUseManualProxy || settings.chainManualProxy {
             try validateManualProxy(settings)
         }
-        guard !["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "UPSTREAM", "DOWNLOAD"].contains(settings.subscriptionNode),
+        guard !["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "UPSTREAM", "RELAY", "DOWNLOAD"].contains(settings.subscriptionNode),
               !settings.subscriptionNode.contains(where: { $0.isNewline }) else {
             throw UserFacingError("请填写订阅中实际的节点名称，不能使用保留名称或换行。")
         }

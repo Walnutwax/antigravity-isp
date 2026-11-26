@@ -5,6 +5,7 @@ enum SettingsStore {
     static let keychainService = "io.github.antigravity-isp.proxy"
     static let keychainAccount = "default"
     static let subscriptionAccount = "subscription"
+    static let relayURIAccount = "relay-uri"
 
     static func load() throws -> ProxySettings {
         guard FileManager.default.fileExists(atPath: AppPaths.settingsFile.path) else { return ProxySettings() }
@@ -12,16 +13,23 @@ enum SettingsStore {
         catch { throw UserFacingError("无法读取已保存的配置，请检查专用目录中的 settings.json。") }
     }
 
-    static func save(_ settings: ProxySettings, password: String, subscriptionURL: String? = nil) throws {
+    static func save(_ settings: ProxySettings, password: String, subscriptionURL: String? = nil,
+                     relayURI: String? = nil) throws {
         try SettingsValidator.validate(settings)
         if settings.useSubscription {
             try SettingsValidator.validateSubscriptionURL(try subscriptionURL ?? loadSubscriptionURL())
+        }
+        if !settings.useSubscription && settings.useRelayURI {
+            _ = try VlessRelayURI(try relayURI ?? loadRelayURI(), localPort: settings.localPort)
         }
         let data = try encode(settings)
         try AppPaths.createPrivateDirectory(AppPaths.supportDirectory)
         try savePassword(password)
         if let subscriptionURL {
             try saveSecret(subscriptionURL, account: subscriptionAccount, label: "Antigravity ISP 订阅地址")
+        }
+        if let relayURI {
+            try saveSecret(relayURI, account: relayURIAccount, label: "Antigravity ISP 加密中转节点")
         }
         try AppPaths.writePrivate(data, to: AppPaths.settingsFile)
     }
@@ -57,6 +65,10 @@ enum SettingsStore {
 
     static func loadSubscriptionURL() throws -> String {
         try loadSecret(account: subscriptionAccount)
+    }
+
+    static func loadRelayURI() throws -> String {
+        try loadSecret(account: relayURIAccount)
     }
 
     private static func loadSecret(account: String) throws -> String {

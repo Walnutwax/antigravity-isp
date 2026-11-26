@@ -67,6 +67,7 @@ struct RuntimeTests {
         do {
             try prepare()
             try testConfigurationAndOwnership()
+            try testChainedVlessRelayConfiguration()
             try testInvalidRoutingDoesNotStart()
             try testOccupiedPort()
             try testApplicationLocator()
@@ -151,6 +152,9 @@ struct RuntimeTests {
         }
         try expect(config["bind-address"] as? String == "127.0.0.1", "Only bind loopback")
         try expect(config["external-controller"] as? String == "", "No external controller")
+        try expect(config["keep-alive-idle"] as? Int == 15, "Keep-Alive idle must be 15s")
+        try expect(config["keep-alive-interval"] as? Int == 15, "Keep-Alive interval must be 15s")
+        try expect(config["disable-keep-alive"] as? Bool == false, "Keep-Alive must be enabled")
         try expect((config["dns"] as? [String: Bool])?["enable"] == false, "DNS service disabled")
         try expect((config["tun"] as? [String: Bool])?["enable"] == false, "TUN disabled")
         try expectFailure("另一个启动器会话") {
@@ -161,6 +165,45 @@ struct RuntimeTests {
         session.stop()
         try expect(!session.isAlive, "Owned relay must stop")
         try expect(try sessionDirectories().isEmpty, "Owned config directory must be removed")
+    }
+
+    private static func testChainedVlessRelayConfiguration() throws {
+        var settings = try settings()
+        settings.useSubscription = false
+        settings.useRelayURI = true
+        settings.splitChainedModelTraffic = true
+        settings.proxyType = "http"
+        settings.directDomains = ["internal.example.org"]
+        let relayURI = "vless://11111111-2222-4333-8444-555555555555@relay.invalid:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.amd.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd1234&type=tcp"
+        let session = try RelaySession.start(settings: settings, password: "landing-password",
+                                             relayURI: relayURI, cancellation: RuntimeCancellation())
+        defer { session.stop() }
+        try expect(session.isAlive, "Chained VLESS relay session should be alive")
+        let directories = try sessionDirectories()
+        try expect(directories.count == 1, "Exactly one chained session directory is expected")
+        let configURL = directories[0].appendingPathComponent("config.json")
+        let fileAttributes = try FileManager.default.attributesOfItem(atPath: configURL.path)
+        try expect((fileAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o600, "Chained config mode must be 0600")
+        let config = try JSONSerialization.jsonObject(with: try Data(contentsOf: configURL)) as! [String: Any]
+        let proxies = config["proxies"] as? [[String: Any]] ?? []
+        try expect(proxies.count == 2, "Chained VLESS config must include RELAY and UPSTREAM proxies")
+        try expect(proxies[0]["name"] as? String == "RELAY" && proxies[0]["type"] as? String == "vless",
+                   "First proxy must be VLESS RELAY")
+        let realityOpts = proxies[0]["reality-opts"] as? [String: Any]
+        try expect(realityOpts?["public-key"] as? String == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                   "Reality public key must be written into private session config")
+        try expect(proxies[1]["name"] as? String == "UPSTREAM"
+                   && proxies[1]["dialer-proxy"] as? String == "RELAY"
+                   && proxies[1]["password"] as? String == "landing-password",
+                   "Landing proxy must dial through RELAY")
+        let rules = config["rules"] as? [String] ?? []
+        try expect(rules.first == "NETWORK,udp,REJECT" && rules.last == "MATCH,RELAY",
+                   "Three-way chained routing must reject UDP and default remaining traffic to RELAY")
+        try expect(rules.contains("DOMAIN-SUFFIX,googleapis.com,UPSTREAM")
+                   && rules.contains("DOMAIN,internal.example.org,DIRECT"),
+                   "Three-way chained routing must pin model domains to UPSTREAM and keep explicit DIRECT rules")
+        session.stop()
+        try expect(try sessionDirectories().isEmpty, "Chained session directory must be removed on stop")
     }
 
     private static func testInvalidRoutingDoesNotStart() throws {

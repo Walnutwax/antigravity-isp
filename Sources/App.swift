@@ -30,11 +30,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let subscriptionNodePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let refreshNodesButton = NSButton()
     private let subscriptionProxyButton = NSButton(checkboxWithTitle: "通过下方手动代理下载订阅（本机直连失败时）", target: nil, action: nil)
+    private let chainManualProxyButton = NSButton(checkboxWithTitle: "链式落地：经订阅节点中转至下方静态代理（dialer-proxy）", target: nil, action: nil)
     private var subscriptionFields: NSStackView!
     private var subscriptionCatalog: SubscriptionCatalog?
     private var fetchingNodes = false
     private var nodeRefreshCancellation: RuntimeCancellation?
     private var manualFields: NSStackView!
+    private let useRelayURIButton = NSButton(checkboxWithTitle: "启用加密中转节点（VLESS Reality / TLS → 下方静态代理）", target: nil, action: nil)
+    private let relayURIField = NSSecureTextField()
+    private var relayURIRow: NSStackView!
+    private let splitModelTrafficButton = NSButton(checkboxWithTitle: "链式三路分流：仅模型/AI 域名走落地代理，其余流量走中转节点", target: nil, action: nil)
     private let protocolPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let serverField = NSTextField()
     private let portField = NSTextField()
@@ -111,6 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             do {
                 passwordField.stringValue = try SettingsStore.loadPassword()
                 subscriptionField.stringValue = try SettingsStore.loadSubscriptionURL()
+                relayURIField.stringValue = try SettingsStore.loadRelayURI()
                 loadedSettings = settings
             } catch {
                 setStatus("已读取代理设置，请重新填写密码或解锁钥匙串。")
@@ -134,7 +140,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 try SettingsValidator.validate(settings)
                 if coreIsInstalled {
                     controller.start(settings: settings, password: passwordField.stringValue,
-                                     subscriptionURL: subscriptionField.stringValue)
+                                     subscriptionURL: subscriptionField.stringValue,
+                                     relayURI: relayURIValue)
                 } else {
                     setStatus("请先安装代理内核，再启动 Antigravity。")
                 }
@@ -376,9 +383,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         subscriptionProxyButton.action = #selector(changeSource)
         editableControls.append(subscriptionProxyButton)
         addFullWidth(subscriptionProxyButton, to: subscriptionFields)
+        chainManualProxyButton.font = .systemFont(ofSize: 12)
+        chainManualProxyButton.target = self
+        chainManualProxyButton.action = #selector(changeSource)
+        chainManualProxyButton.toolTip = "订阅节点作为加密中转（RELAY），经 dialer-proxy 转发至下方手动静态代理落地"
+        editableControls.append(chainManualProxyButton)
+        addFullWidth(chainManualProxyButton, to: subscriptionFields)
         addFullWidth(subscriptionFields, to: fields)
 
         manualFields = verticalStack(spacing: 11)
+        useRelayURIButton.font = .systemFont(ofSize: 12)
+        useRelayURIButton.target = self
+        useRelayURIButton.action = #selector(changeSource)
+        useRelayURIButton.toolTip = "使用自建 VLESS Reality / TLS 节点作为加密中转，减少明文 HTTP 代理跨境被 RST 重置"
+        editableControls.append(useRelayURIButton)
+        addFullWidth(useRelayURIButton, to: manualFields)
+
+        configureField(relayURIField, placeholder: "vless://UUID@host:443?security=reality&sni=...&pbk=...&sid=...", accessibility: "加密中转链接")
+        relayURIField.toolTip = "中转节点链接保存在本机钥匙串，不写入明文设置文件"
+        let pasteRelay = NSButton()
+        configureButton(pasteRelay, title: "粘贴", action: #selector(importRelayURI))
+        pasteRelay.toolTip = "从剪贴板导入 vless:// Reality 或 TLS 链接"
+        editableControls.append(pasteRelay)
+        relayURIRow = formRow("中转链接", field: horizontalStack([relayURIField, pasteRelay], spacing: 8))
+        addFullWidth(relayURIRow, to: manualFields)
+
         configureButton(importProxyButton, title: "从剪贴板导入", action: #selector(importProxy))
         importProxyButton.toolTip = "导入 http://、https://、socks5:// 或服务器:端口；支持链接中的账号密码"
         editableControls.append(importProxyButton)
@@ -407,8 +436,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         addFullWidth(formRow("用户名", field: usernameField), to: manualFields)
         configureField(passwordField, placeholder: "可选", accessibility: "代理密码")
         addFullWidth(formRow("密码", field: passwordField), to: manualFields)
-        addFullWidth(formRow("", field: label("密码保存在此 Mac 的钥匙串中。", size: 11, color: .secondaryLabelColor)), to: manualFields)
+        addFullWidth(formRow("", field: label("密码与中转链接保存在此 Mac 的钥匙串中。", size: 11, color: .secondaryLabelColor)), to: manualFields)
         addFullWidth(manualFields, to: fields)
+
+        splitModelTrafficButton.font = .systemFont(ofSize: 12)
+        splitModelTrafficButton.toolTip = "开启后，仅模型/AI 核心域名与出口探测经链式落地代理，普通海外流量直接走中转节点"
+        editableControls.append(splitModelTrafficButton)
+        addFullWidth(splitModelTrafficButton, to: fields)
 
         advancedButton.title = "高级设置"
         advancedButton.image = NSImage(systemSymbolName: "chevron.forward", accessibilityDescription: nil)
@@ -422,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         advancedButton.setAccessibilityLabel("展开高级设置")
         let advancedHeader = horizontalStack([
             advancedButton,
-            label("出口 IP、端口与公司域名", size: 11, color: .secondaryLabelColor),
+            label("出口 IP、端口与直连分流", size: 11, color: .secondaryLabelColor),
             NSView()
         ], spacing: 8)
         addFullWidth(advancedHeader, to: fields)
@@ -440,7 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         addFullWidth(formRow("本地端口", field: localPortRow), to: advancedFields)
         configureField(directDomainsField, placeholder: "例如 portal.example.com", accessibility: "精确直连域名")
         addFullWidth(formRow("精确直连域名", field: directDomainsField), to: advancedFields)
-        configureField(directDomainSuffixesField, placeholder: "例如 corp.example.org（含子域名）", accessibility: "直连域名后缀")
+        configureField(directDomainSuffixesField, placeholder: "例如 internal.example.org（含子域名）", accessibility: "直连域名后缀")
         addFullWidth(formRow("直连域名后缀", field: directDomainSuffixesField), to: advancedFields)
         let routingHint = NSTextField(wrappingLabelWithString:
             "多个域名可用逗号或空格分隔。留空时，代理请求均走上游。运行期间可应用分流，新规则用于后续连接。")
@@ -557,6 +591,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func populate(_ settings: ProxySettings, password: String) {
         sourceControl.selectedSegment = settings.useSubscription || settings.server.isEmpty ? 0 : 1
         subscriptionProxyButton.state = settings.subscriptionUseManualProxy ? .on : .off
+        chainManualProxyButton.state = settings.chainManualProxy ? .on : .off
+        useRelayURIButton.state = settings.useRelayURI ? .on : .off
+        splitModelTrafficButton.state = settings.splitChainedModelTraffic ? .on : .off
         populateNodePopup(nodes: subscriptionCatalog?.nodes.map(\.name) ?? [], selected: settings.subscriptionNode)
         updateSourceFields()
         let index = ["http", "https", "socks5"].firstIndex(of: settings.proxyType) ?? 0
@@ -583,8 +620,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let trimming = CharacterSet.whitespacesAndNewlines
         let useSubscription = sourceControl.selectedSegment == 0
         let useDownloadProxy = subscriptionProxyButton.state == .on
+        let chainManual = useSubscription && chainManualProxyButton.state == .on
+        let useRelay = !useSubscription && useRelayURIButton.state == .on
+        let needsManualProxy = !useSubscription || useDownloadProxy || chainManual
         let port = Int(portField.stringValue.trimmingCharacters(in: trimming)) ?? 0
-        guard (useSubscription && !useDownloadProxy) || (1...65535).contains(port) else {
+        guard !needsManualProxy || (1...65535).contains(port) else {
             window.makeFirstResponder(portField)
             throw FormError.invalidPort("代理端口")
         }
@@ -597,10 +637,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         settings.useSubscription = useSubscription
         settings.subscriptionNode = subscriptionNodePopup.selectedItem?.representedObject as? String ?? ""
         settings.subscriptionUseManualProxy = useDownloadProxy
+        settings.chainManualProxy = chainManual
+        settings.useRelayURI = useRelay
+        settings.splitChainedModelTraffic = (chainManual || useRelay) && splitModelTrafficButton.state == .on
         if useSubscription { try SettingsValidator.validateSubscriptionURL(subscriptionAddress) }
+        if useRelay { _ = try VlessRelayURI(relayURIValue, localPort: localPort) }
         settings.proxyType = protocolPopup.selectedItem?.representedObject as? String ?? "http"
         settings.server = serverField.stringValue.trimmingCharacters(in: trimming)
-        settings.port = port == 0 && useSubscription && !useDownloadProxy ? 8080 : port
+        settings.port = port == 0 && !needsManualProxy ? 8080 : port
         settings.username = usernameField.stringValue
         settings.appPath = selectedApplicationPath()
         settings.expectedExitIP = expectedExitIPField.stringValue.trimmingCharacters(in: trimming)
@@ -617,6 +661,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func readRouting() throws -> RoutingPolicy {
         var settings = ProxySettings()
+        let useSubscription = sourceControl.selectedSegment == 0
+        settings.useSubscription = useSubscription
+        settings.chainManualProxy = useSubscription && chainManualProxyButton.state == .on
+        settings.useRelayURI = !useSubscription && useRelayURIButton.state == .on
+        settings.splitChainedModelTraffic = splitModelTrafficButton.state == .on
         let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",，"))
         settings.directDomains = directDomainsField.stringValue.components(separatedBy: separators).filter { !$0.isEmpty }
         settings.directDomainSuffixes = directDomainSuffixesField.stringValue.components(separatedBy: separators).filter { !$0.isEmpty }
@@ -648,8 +697,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func saveSettings() {
         guard !isBusy, window.makeFirstResponder(nil) else { return }
         do {
-            try SettingsStore.save(readSettings(), password: passwordField.stringValue, subscriptionURL: subscriptionAddress)
-            setStatus("设置已保存，密码与订阅地址保存在本机钥匙串。")
+            try SettingsStore.save(readSettings(), password: passwordField.stringValue,
+                                   subscriptionURL: subscriptionAddress, relayURI: relayURIValue)
+            setStatus("设置已保存，密码、订阅地址与中转链接保存在本机钥匙串。")
         } catch {
             showError(error)
         }
@@ -673,16 +723,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let settings = try readSettings()
             let password = passwordField.stringValue
             let subscriptionURL = subscriptionAddress
+            let relayURI = relayURIValue
             if launch {
                 try LauncherController.validateApplicationForLaunch(at: URL(fileURLWithPath: settings.appPath))
-                try SettingsStore.save(settings, password: password, subscriptionURL: subscriptionURL)
+                try SettingsStore.save(settings, password: password, subscriptionURL: subscriptionURL, relayURI: relayURI)
             }
             let connect: () -> Void = { [weak self] in
                 guard let self else { return }
                 if launch {
-                    self.controller.start(settings: settings, password: password, subscriptionURL: subscriptionURL)
+                    self.controller.start(settings: settings, password: password,
+                                          subscriptionURL: subscriptionURL, relayURI: relayURI)
                 } else {
-                    self.controller.test(settings: settings, password: password, subscriptionURL: subscriptionURL)
+                    self.controller.test(settings: settings, password: password,
+                                         subscriptionURL: subscriptionURL, relayURI: relayURI)
                 }
             }
             if coreIsInstalled { connect() }
@@ -711,14 +764,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         subscriptionField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var relayURIValue: String {
+        relayURIField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @objc private func importRelayURI() {
+        guard !isBusy, window.makeFirstResponder(nil) else { return }
+        do {
+            let raw = (NSPasteboard.general.string(forType: .string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let localPort = Int(localPortField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 17898
+            _ = try VlessRelayURI(raw, localPort: localPort)
+            relayURIField.stringValue = raw
+            useRelayURIButton.state = .on
+            sourceControl.selectedSegment = 1
+            updateSourceFields()
+            setStatus("已填入加密中转链接，点击“测试连接”验证链式出口；启动时会自动存入钥匙串。")
+        } catch {
+            showError(error)
+        }
+    }
+
     @objc private func changeSource() {
         updateSourceFields()
     }
 
     private func updateSourceFields() {
         let usesSubscription = sourceControl.selectedSegment == 0
+        let chainSub = usesSubscription && chainManualProxyButton.state == .on
+        let useRelay = !usesSubscription && useRelayURIButton.state == .on
         subscriptionFields.isHidden = !usesSubscription
-        manualFields.isHidden = usesSubscription && subscriptionProxyButton.state != .on
+        manualFields.isHidden = usesSubscription && subscriptionProxyButton.state != .on && !chainSub
+        useRelayURIButton.isHidden = usesSubscription
+        relayURIRow.isHidden = !useRelay
+        splitModelTrafficButton.isHidden = !(chainSub || useRelay)
     }
 
     @objc private func importSubscription() {
@@ -828,18 +906,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func refreshSubscriptionNodes() {
         guard !isBusy, window.makeFirstResponder(nil) else { return }
-        let settings: ProxySettings
+        guard sourceControl.selectedSegment == 0 else { return }
+        let url = subscriptionAddress
+        let proxy: SubscriptionDownloadProxy?
         do {
-            settings = try readSettings()
+            try SettingsValidator.validateSubscriptionURL(url)
+            if subscriptionProxyButton.state == .on {
+                let trimming = CharacterSet.whitespacesAndNewlines
+                let port = Int(portField.stringValue.trimmingCharacters(in: trimming)) ?? 0
+                guard (1...65535).contains(port) else {
+                    window.makeFirstResponder(portField)
+                    throw FormError.invalidPort("代理端口")
+                }
+                var downloadSettings = ProxySettings()
+                downloadSettings.useSubscription = false
+                downloadSettings.proxyType = protocolPopup.selectedItem?.representedObject as? String ?? "http"
+                downloadSettings.server = serverField.stringValue.trimmingCharacters(in: trimming)
+                downloadSettings.port = port
+                downloadSettings.username = usernameField.stringValue
+                try SettingsValidator.validate(downloadSettings)
+                proxy = SubscriptionDownloadProxy(settings: downloadSettings, password: passwordField.stringValue)
+            } else {
+                proxy = nil
+            }
         } catch {
             showError(error)
             return
         }
-        guard settings.useSubscription else { return }
-        let url = subscriptionAddress
-        let proxy: SubscriptionDownloadProxy? = settings.subscriptionUseManualProxy
-            ? SubscriptionDownloadProxy(settings: settings, password: passwordField.stringValue)
-            : nil
         let cancellation = RuntimeCancellation()
         nodeRefreshCancellation = cancellation
         fetchingNodes = true

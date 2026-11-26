@@ -39,8 +39,10 @@ struct ModelTests {
         try testSettingsMigration()
         try testRoutingPolicy()
         try testProxyImport()
+        try testVlessRelayURI()
         try testSubscriptionParser()
         try testSubscriptionConfiguration()
+        try testChainedConfigurations()
         try testSubscriptionUsage()
         try testSubscriptionCatalog()
         try testSubscriptionCurlRequest()
@@ -61,7 +63,7 @@ struct ModelTests {
         let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
         precondition(contents == updated)
         precondition(entries == ["settings.json"])
-        print("PASS: invalid configurations, self-proxy loop, password-free settings, legacy migration, routing guardrails/order, proxy URL import, subscription parsing/config/usage/curl-config/cache, invalid offline core rejection, private atomic writes")
+        print("PASS: invalid configurations, self-proxy loop, password-free settings, legacy migration, routing guardrails/order, proxy URL import, VLESS relay parsing, chained landing/three-way routing/keep-alive, subscription parsing/config/usage/curl-config/cache, invalid offline core rejection, private atomic writes")
     }
 
     private static func testProxyImport() throws {
@@ -79,6 +81,59 @@ struct ModelTests {
                         "http://proxy.example.com:abc", "http://proxy.example.com\nother", "http://:password@proxy.example.com",
                         "http://user%3Aname:password@proxy.example.com", "127.0.0.1:17898"] {
             try expectFailure("Invalid proxy import accepted: \(invalid)") { _ = try ProxyImport(invalid) }
+        }
+    }
+
+    private static func testVlessRelayURI() throws {
+        let validKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        let realityURI = "  vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.amd.com&fp=chrome&pbk=\(validKey)&sid=abcd1234&type=tcp#Example\n"
+        let reality = try VlessRelayURI(realityURI, localPort: 17898)
+        precondition(reality.uuid == "11111111-2222-4333-8444-555555555555")
+        precondition(reality.server == "relay.example.com" && reality.port == 443)
+        precondition(reality.security == "reality" && reality.sni == "www.amd.com")
+        precondition(reality.flow == "xtls-rprx-vision" && reality.fingerprint == "chrome")
+        precondition(reality.publicKey == validKey && reality.shortID == "abcd1234")
+        let realityProxy = reality.toMihomoProxy(name: "RELAY")
+        precondition(realityProxy["name"] as? String == "RELAY" && realityProxy["type"] as? String == "vless")
+        precondition(realityProxy["tls"] as? Bool == true && realityProxy["udp"] as? Bool == false)
+        precondition(realityProxy["network"] as? String == "tcp" && realityProxy["servername"] as? String == "www.amd.com")
+        precondition(realityProxy["flow"] as? String == "xtls-rprx-vision" && realityProxy["client-fingerprint"] as? String == "chrome")
+        let realityOpts = realityProxy["reality-opts"] as? [String: Any]
+        precondition(realityOpts?["public-key"] as? String == validKey && realityOpts?["short-id"] as? String == "abcd1234")
+
+        // Reality without optional sid/fp defaults fingerprint to chrome and omits short-id.
+        let minimalReality = try VlessRelayURI("vless://11111111-2222-4333-8444-555555555555@[2001:db8::1]:443?security=reality&sni=www.amd.com&pbk=\(validKey)")
+        precondition(minimalReality.server == "2001:db8::1" && minimalReality.fingerprint == "chrome" && minimalReality.shortID.isEmpty)
+        let minimalOpts = minimalReality.toMihomoProxy()["reality-opts"] as? [String: Any]
+        precondition(minimalOpts?["public-key"] as? String == validKey && minimalOpts?["short-id"] == nil)
+
+        // Plain VLESS over TLS is accepted without reality-opts.
+        let tls = try VlessRelayURI("vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=tls&sni=relay.example.com&type=tcp")
+        precondition(tls.security == "tls" && tls.fingerprint.isEmpty)
+        let tlsProxy = tls.toMihomoProxy()
+        precondition(tlsProxy["tls"] as? Bool == true && tlsProxy["reality-opts"] == nil && tlsProxy["client-fingerprint"] == nil)
+
+        let invalidURIs = [
+            "", " ",
+            "vmess://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=tls",
+            "vless://not-a-uuid@relay.example.com:443?security=tls",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com?security=tls",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:0?security=tls",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=none",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=tls&type=ws",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=tls&encryption=aes",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=reality&pbk=\(validKey)",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=reality&sni=www.amd.com&pbk=short",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=reality&sni=www.amd.com&pbk=\(validKey)&sid=zzzz",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=reality&sni=www.amd.com&pbk=\(validKey)&sid=0123456789abcdef0",
+            "vless://11111111-2222-4333-8444-555555555555@127.0.0.1:17898?security=tls&sni=relay.example.com",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=tls&sni=bad..example.com",
+            "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?security=tls\nextra"
+        ]
+        for invalid in invalidURIs {
+            try expectFailure("Invalid VLESS relay URI accepted: \(invalid)") {
+                _ = try VlessRelayURI(invalid, localPort: 17898)
+            }
         }
     }
 
@@ -114,6 +169,8 @@ struct ModelTests {
         var settings = try JSONDecoder().decode(ProxySettings.self, from: legacy)
         precondition(settings.directDomains.isEmpty && settings.directDomainSuffixes.isEmpty)
         precondition(!settings.themeEnabled && settings.themeNodePath.isEmpty, "Older settings must keep the theme optional")
+        precondition(!settings.chainManualProxy && !settings.useRelayURI && !settings.splitChainedModelTraffic && !settings.isChained,
+                     "Older settings must default chained relay options to disabled")
         precondition(settings.server == "proxy.example.com" && settings.port == 8443)
         precondition(settings.username == "test-user" && settings.localPort == 17899)
         precondition(settings.proxyType == "https" && settings.expectedExitIP == "203.0.113.7" && settings.autoStart)
@@ -123,13 +180,17 @@ struct ModelTests {
         settings.directDomainSuffixes = ["assets.example.org"]
         settings.themeEnabled = true
         settings.themeNodePath = "/usr/local/bin/node"
+        settings.useRelayURI = true
+        settings.splitChainedModelTraffic = true
         let updated = try JSONEncoder().encode(settings)
         let roundTrip = try JSONDecoder().decode(ProxySettings.self, from: updated)
-        precondition(roundTrip == settings, "Routing and theme settings must survive persistence")
+        precondition(roundTrip == settings, "Routing, chained relay and theme settings must survive persistence")
         let fields = try JSONSerialization.jsonObject(with: updated) as! [String: Any]
         precondition(fields["directDomains"] as? [String] == settings.directDomains)
         precondition(fields["directDomainSuffixes"] as? [String] == settings.directDomainSuffixes)
-        precondition(fields["password"] == nil, "Migration must not introduce persisted passwords")
+        precondition(fields["useRelayURI"] as? Bool == true && fields["splitChainedModelTraffic"] as? Bool == true)
+        precondition(fields["password"] == nil && fields["relayURI"] == nil,
+                     "Migration must not introduce persisted passwords or relay URIs")
     }
 
     private static func testSubscriptionParser() throws {
@@ -317,6 +378,88 @@ struct ModelTests {
         precondition(manual["proxy-providers"] == nil && manual["proxy-groups"] == nil)
         precondition((manual["proxies"] as? [[String: Any]])?.count == 1)
         precondition(manual["external-controller-unix"] == nil)
+        precondition(manual["keep-alive-idle"] as? Int == 15
+                     && manual["keep-alive-interval"] as? Int == 15
+                     && manual["disable-keep-alive"] as? Bool == false)
+    }
+
+    private static func testChainedConfigurations() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AntigravityISP-chained-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let provider = directory.appendingPathComponent("subscription.yaml")
+        try Data("proxies: []\n".utf8).write(to: provider)
+
+        // Subscription-chained landing requires a valid manual landing proxy.
+        var subChained = ProxySettings()
+        subChained.useSubscription = true
+        subChained.chainManualProxy = true
+        try expectFailure("Chained subscription without landing server was accepted") {
+            try SettingsValidator.validate(subChained)
+        }
+        subChained.server = "isp.example.com"
+        subChained.port = 12321
+        subChained.proxyType = "http"
+        subChained.username = "isp-user"
+        subChained.subscriptionNode = "RELAY"
+        try expectFailure("Reserved node name RELAY was accepted") {
+            try SettingsValidator.validate(subChained)
+        }
+        subChained.subscriptionNode = "US - 01"
+        subChained.splitChainedModelTraffic = true
+        subChained.directDomains = ["internal.example.org"]
+        try SettingsValidator.validate(subChained)
+
+        let subConfig = try RelayConfiguration.make(
+            settings: subChained, password: "isp-password", subscriptionProviderPath: provider.path,
+            controllerSocket: directory.appendingPathComponent("controller.sock").path,
+            controllerSecret: "test-secret")
+        let subGroup = (subConfig["proxy-groups"] as? [[String: Any]])?.first
+        precondition(subGroup?["name"] as? String == "RELAY" && subGroup?["type"] as? String == "select")
+        let subProxies = subConfig["proxies"] as? [[String: Any]] ?? []
+        precondition(subProxies.count == 1 && subProxies[0]["name"] as? String == "UPSTREAM"
+                     && subProxies[0]["dialer-proxy"] as? String == "RELAY")
+        let subRules = subConfig["rules"] as? [String] ?? []
+        precondition(subRules.first == "NETWORK,udp,REJECT" && subRules.last == "MATCH,RELAY")
+        precondition(subRules.contains("DOMAIN-SUFFIX,googleapis.com,UPSTREAM")
+                     && subRules.contains("DOMAIN-SUFFIX,antigravity.google,UPSTREAM")
+                     && subRules.contains("DOMAIN-SUFFIX,antigravity-unleash.goog,UPSTREAM")
+                     && subRules.contains("DOMAIN-SUFFIX,anthropic.com,UPSTREAM")
+                     && subRules.contains("DOMAIN-SUFFIX,openai.com,UPSTREAM")
+                     && subRules.contains("DOMAIN,internal.example.org,DIRECT"))
+
+        // Manual + VLESS Reality relay builds RELAY -> UPSTREAM without proxy-providers.
+        var vlessChained = ProxySettings()
+        vlessChained.useSubscription = false
+        vlessChained.useRelayURI = true
+        vlessChained.server = "isp.example.com"
+        vlessChained.port = 12321
+        vlessChained.proxyType = "http"
+        vlessChained.username = "isp-user"
+        vlessChained.splitChainedModelTraffic = false
+        let sampleRelay = "vless://11111111-2222-4333-8444-555555555555@relay.example.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.amd.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd1234&type=tcp"
+        let vlessConfig = try RelayConfiguration.make(
+            settings: vlessChained, password: "isp-password", subscriptionProviderPath: nil,
+            controllerSocket: "/tmp/controller.sock", controllerSecret: "test-secret",
+            relayURI: sampleRelay)
+        precondition(vlessConfig["proxy-providers"] == nil && vlessConfig["proxy-groups"] == nil)
+        let vlessProxies = vlessConfig["proxies"] as? [[String: Any]] ?? []
+        precondition(vlessProxies.count == 2)
+        precondition(vlessProxies[0]["name"] as? String == "RELAY" && vlessProxies[0]["type"] as? String == "vless")
+        precondition(vlessProxies[1]["name"] as? String == "UPSTREAM" && vlessProxies[1]["dialer-proxy"] as? String == "RELAY")
+        precondition((vlessConfig["rules"] as? [String])?.last == "MATCH,UPSTREAM")
+        precondition(vlessConfig["keep-alive-idle"] as? Int == 15
+                     && vlessConfig["keep-alive-interval"] as? Int == 15
+                     && vlessConfig["disable-keep-alive"] as? Bool == false)
+
+        // Non-chained mode must ignore splitChainedModelTraffic so rules never point to a nonexistent RELAY.
+        var singleHop = ProxySettings()
+        singleHop.server = "proxy.example.com"
+        singleHop.splitChainedModelTraffic = true
+        precondition(!singleHop.isChained)
+        let singleRouting = try RoutingPolicy(settings: singleHop)
+        precondition(!singleRouting.splitChainedModelTraffic && singleRouting.rules.last == "MATCH,UPSTREAM")
     }
 
     private static func testSubscriptionCatalog() throws {

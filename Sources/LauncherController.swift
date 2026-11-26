@@ -24,12 +24,12 @@ final class LauncherController {
     private var application: NSRunningApplication?
     private var stopping = false
 
-    func start(settings: ProxySettings, password: String, subscriptionURL: String = "") {
-        begin(settings: settings, password: password, subscriptionURL: subscriptionURL, launchApplication: true)
+    func start(settings: ProxySettings, password: String, subscriptionURL: String = "", relayURI: String = "") {
+        begin(settings: settings, password: password, subscriptionURL: subscriptionURL, relayURI: relayURI, launchApplication: true)
     }
 
-    func test(settings: ProxySettings, password: String, subscriptionURL: String = "") {
-        begin(settings: settings, password: password, subscriptionURL: subscriptionURL, launchApplication: false)
+    func test(settings: ProxySettings, password: String, subscriptionURL: String = "", relayURI: String = "") {
+        begin(settings: settings, password: password, subscriptionURL: subscriptionURL, relayURI: relayURI, launchApplication: false)
     }
 
     func applyRouting(_ routing: RoutingPolicy, persist: @escaping () throws -> Void) {
@@ -107,7 +107,7 @@ final class LauncherController {
         }
     }
 
-    private func begin(settings: ProxySettings, password: String, subscriptionURL: String, launchApplication: Bool) {
+    private func begin(settings: ProxySettings, password: String, subscriptionURL: String, relayURI: String, launchApplication: Bool) {
         guard !isRunning && operationTask == nil && stopTask == nil else {
             report("已有启动、测试或应用会话，请先停止当前会话。", busy: true)
             return
@@ -115,6 +115,9 @@ final class LauncherController {
         do {
             try SettingsValidator.validate(settings)
             if settings.useSubscription { try SettingsValidator.validateSubscriptionURL(subscriptionURL) }
+            if !settings.useSubscription && settings.useRelayURI {
+                _ = try VlessRelayURI(relayURI, localPort: settings.localPort)
+            }
             if launchApplication {
                 try Self.validateApplicationForLaunch(at: URL(fileURLWithPath: settings.appPath))
             }
@@ -142,7 +145,7 @@ final class LauncherController {
             do {
                 let session = try await Task.detached(priority: .userInitiated) {
                     try RelaySession.start(settings: settings, password: password, subscriptionURL: subscriptionURL,
-                                           progress: progress, cancellation: token)
+                                           relayURI: relayURI, progress: progress, cancellation: token)
                 }.value
                 self.relay = session
                 try token.check()
@@ -434,12 +437,16 @@ final class RelaySession: @unchecked Sendable {
     }
 
     static func start(settings: ProxySettings, password: String, subscriptionURL: String = "",
+                      relayURI: String = "",
                       progress: (@Sendable (String) -> Void)? = nil,
                       cancellation: RuntimeCancellation) throws -> RelaySession {
         try cancellation.check()
         // Validate here as well as in the UI so every caller fails before spawning a relay.
         try SettingsValidator.validate(settings)
         if settings.useSubscription { try SettingsValidator.validateSubscriptionURL(subscriptionURL) }
+        if !settings.useSubscription && settings.useRelayURI {
+            _ = try VlessRelayURI(relayURI, localPort: settings.localPort)
+        }
         guard FileManager.default.isExecutableFile(atPath: AppPaths.mihomoExecutable.path) else {
             throw RuntimeFailure("未找到可执行的 Mihomo，请先安装代理内核。")
         }
@@ -489,7 +496,8 @@ final class RelaySession: @unchecked Sendable {
             let configuration = try RelayConfiguration.make(settings: settings, password: password,
                 subscriptionProviderPath: providerPath,
                 controllerSocket: session.controllerSocket?.path ?? "",
-                controllerSecret: session.controllerSecret)
+                controllerSecret: session.controllerSecret,
+                relayURI: relayURI)
             try session.writeConfigurationData(RelayConfiguration.serialize(configuration), to: session.configURL)
             // Re-check after the download: the port could have been taken while fetching.
             try session.requireFreePort()
@@ -506,7 +514,8 @@ final class RelaySession: @unchecked Sendable {
             try session.process.run()
             try session.waitUntilListening(cancellation: cancellation)
             if settings.useSubscription {
-                try session.waitForSubscription(node: settings.subscriptionNode, cancellation: cancellation)
+                let groupName = settings.chainManualProxy ? "RELAY" : "UPSTREAM"
+                try session.waitForSubscription(node: settings.subscriptionNode, groupName: groupName, cancellation: cancellation)
             }
             return session
         } catch {
@@ -515,7 +524,7 @@ final class RelaySession: @unchecked Sendable {
         }
     }
 
-    private func waitForSubscription(node: String, cancellation: RuntimeCancellation) throws {
+    private func waitForSubscription(node: String, groupName: String = "UPSTREAM", cancellation: RuntimeCancellation) throws {
         let deadline = Date().addingTimeInterval(12)
         var healthCheckDeadline: Date?
         while Date() < deadline {
@@ -529,7 +538,7 @@ final class RelaySession: @unchecked Sendable {
                     guard subscriptionNodes.contains(node) else {
                         throw RuntimeFailure("订阅中没有名为“\(node)”的节点。请在“节点”中重新选择，或点击“刷新节点”后再试。")
                     }
-                    if let group = try controllerRequest("/proxies/UPSTREAM", cancellation: cancellation),
+                    if let group = try controllerRequest("/proxies/\(groupName)", cancellation: cancellation),
                        group["now"] as? String == node {
                         return
                     }

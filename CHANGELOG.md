@@ -1,5 +1,17 @@
 # Changelog / 更新记录
 
+## v0.6.0 — Preview / 预览版
+
+- Add chained encrypted landing (`dialer-proxy`): route a static HTTP/HTTPS/SOCKS5 landing proxy (`UPSTREAM`) through either a Clash/Mihomo subscription node or a self-hosted VLESS Reality/TLS relay URI (`RELAY`). Store VLESS relay URIs in macOS Keychain (`relay-uri` account) instead of `settings.json`.
+- Add optional three-way split routing in chained mode: pin exit probes and core AI/model domains (Google, Antigravity, Anthropic, OpenAI) to `UPSTREAM`, keep explicit custom domains on `DIRECT`, and route remaining traffic through `RELAY`.
+- Enable Mihomo TCP Keep-Alive by default (`keep-alive-idle: 15`, `keep-alive-interval: 15`, `disable-keep-alive: false`) to keep long-lived HTTP/2 and streaming connections stable.
+- Add a sanitized self-hosted Xray VLESS Reality server template (`examples/xray-reality-server.example.json`) with Mihomo `v1.19.34` compatibility notes (`Xray-core v26.6.27` and `"sniffing": {"enabled": false}`), and make UI/documentation wording general-purpose for any custom direct-domain workflow.
+
+- 新增链式加密落地（`dialer-proxy`）：支持通过 Clash/Mihomo 订阅节点或自建 VLESS Reality/TLS 中转节点（`RELAY`）转发至静态 HTTP/HTTPS/SOCKS5 落地代理（`UPSTREAM`）；VLESS 中转链接单独保存在钥匙串（`relay-uri` 账户），不写入明文 `settings.json`。
+- 链式模式新增可选三路分流：出口探测与核心模型/AI 域名（Google、Antigravity、Anthropic、OpenAI）固定走静态落地（`UPSTREAM`），自定义直连域名走 `DIRECT`，其余流量直接走加密中转节点（`RELAY`）。
+- 本地 Mihomo 默认开启 TCP Keep-Alive（`keep-alive-idle: 15`、`keep-alive-interval: 15`），提升长对话与流式响应连接稳定性。
+- 新增去敏的自建 Xray VLESS Reality 服务端示例（`examples/xray-reality-server.example.json`）与 Mihomo `v1.19.34` 兼容性说明（固定 `Xray-core v26.6.27` 并关闭入站 `sniffing`），并将界面与文档表述调整为通用直连分流方案。
+
 ## v0.5.0 — Preview / 预览版
 
 - Add an optional launcher-managed Codex Theme for the standalone Antigravity App, including Chinese localization, time-to-first-token and context metrics, and a completed compaction count.
@@ -41,9 +53,9 @@
 - Add advanced settings for exact direct domains (`directDomains`) and direct domain suffixes (`directDomainSuffixes`), both empty by default. Accept comma or whitespace separated entries; reject direct entries for known model service domains.
 - Reject UDP in the local relay, keep exit-check domains on `UPSTREAM`, route explicitly configured domains to `DIRECT`, and send remaining requests to `UPSTREAM` without a direct fallback.
 - Apply saved settings on the next launch; no live reload, system proxy changes, TUN, or continuous exit-IP monitoring.
-- Document company DNS/VPN/SSO prerequisites, proxy-aware tool coverage, and the separate paths for retrieving internal content and sending it to a model service. Keep existing local route checks distinct from validation of the public Swift build.
+- Document private-network DNS/VPN/SSO prerequisites, proxy-aware tool coverage, and the separate paths for retrieving private content and sending it to a model service. Keep existing local route checks distinct from validation of the public Swift build.
 
 - 高级设置新增精确直连域名和直连域名后缀，默认均为空，支持逗号或空白分隔；拒绝已知模型服务域名的直连配置。
 - 本地转发拒绝 UDP，出口检测域名固定走上游；仅明确配置的域名直连，其余请求走上游，不提供直连回退。
 - 保存后下次启动生效，不支持热更新；不修改系统代理、不启用 TUN、不持续监测出口 IP。
-- 补充公司 DNS、VPN、SSO 前提、工具遵循代理的范围，以及内网取数和向模型发送内容的两条路径；分别记录既有本机分流验证与公开 Swift 构建验证。
+- 补充本地/私有网络 DNS、VPN、认证前提、工具遵循代理的范围，以及本地取数和向模型发送内容的两条路径；分别记录既有本机分流验证与公开 Swift 构建验证。
